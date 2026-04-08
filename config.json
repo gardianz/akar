@@ -1,0 +1,19 @@
+{
+  "send": {
+    "maxLoopTx": 10,
+    "minDelayTxSeconds": 10,
+    "maxDelayTxSeconds": 30,
+    "delayCycleSeconds": 35,
+    "randomAmount": {
+      "enabled": true,
+      "min": "20",
+      "max": "25",
+      "decimals": 2
+    }
+  },
+  "recipientFile": "recipient.txt",
+  "ui": {
+    "dashboard": true,
+    "logLines": 5
+  }
+}
