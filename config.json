@@ -1,19 +1,27 @@
 {
   "send": {
-    "maxLoopTx": 10,
-    "minDelayTxSeconds": 10,
-    "maxDelayTxSeconds": 30,
-    "delayCycleSeconds": 35,
+    "maxLoopTx": 342,
+    "minDelayTxSeconds": 1,
+    "maxDelayTxSeconds": 5,
+    "delayCycleSeconds": 25,
+    "sequentialAllRounds": true,
     "randomAmount": {
       "enabled": true,
-      "min": "20",
-      "max": "25",
+      "min": "26",
+      "max": "27",
       "decimals": 2
     }
   },
   "recipientFile": "recipient.txt",
+  "session": {
+    "proactiveVercelRefreshMinutes": 0,
+    "browserChallengeRetryAfterSeconds": 120,
+    "maxSessionReuseTransientAttempts": 4,
+    "maxConcurrentSessionReuse": 1,
+    "sessionReuseRetryJitterSeconds": 12
+  },
   "ui": {
     "dashboard": true,
-    "logLines": 5
+    "logLines": 20
   }
 }
