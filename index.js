@@ -26,134 +26,302 @@ const DEFAULT_CONFIG_FILE = "config.json";
 const DEFAULT_ACCOUNTS_FILE = "accounts.json";
 const DEFAULT_TOKENS_FILE = "tokens.json";
 
+const rawBrowserChallengeConcurrency = Number(process.env.ROOTSFI_MAX_BROWSER_CONCURRENCY);
+const BROWSER_CHALLENGE_MAX_CONCURRENT =
+  Number.isFinite(rawBrowserChallengeConcurrency) && rawBrowserChallengeConcurrency > 0
+    ? Math.floor(rawBrowserChallengeConcurrency)
+    : 1;
+const BROWSER_LAUNCH_TIMEOUT_MS = 120000;
+const BROWSER_CHALLENGE_MAX_ATTEMPTS = 20;
+const BROWSER_CHALLENGE_MAX_ATTEMPTS_ON_429 = 20;
+const BROWSER_CHALLENGE_RETRY_ATTEMPTS_ON_429 = 10;
+const BROWSER_CHALLENGE_RETRY_DELAY_MS = 15000;
+const rawSessionReuseConcurrency = Number(process.env.ROOTSFI_MAX_SESSION_REUSE_CONCURRENCY);
+let SESSION_REUSE_MAX_CONCURRENT =
+  Number.isFinite(rawSessionReuseConcurrency) && rawSessionReuseConcurrency > 0
+    ? Math.floor(rawSessionReuseConcurrency)
+    : 1;
+let activeBrowserChallenges = 0;
+const browserChallengeWaitQueue = [];
+let activeSessionReuseChallenges = 0;
+const sessionReuseWaitQueue = [];
+const cachedSecurityCookies = new Map();
+let browserChallengeRateLimitedUntilMs = 0;
+
 // ============================================================================
-// ONE-DIRECTIONAL RING STRATEGY (Parallel Execution)
+// CONNECTION POOL RESET FOR SOFT RESTART RECOVERY
 // ============================================================================
-// Pattern: Fixed ring direction, all accounts send in parallel
-// - Round N: A→B, B→C, C→D, D→A (semua bersamaan)
-// - Round N+1: sama, A→B, B→C, C→D, D→A (semua bersamaan)
-// 
-// Benefits:
-// - NO reciprocal pairs dalam round yang sama (A→B tidak konflik dengan B→C)
-// - Parallel execution = lebih cepat
-// - Predictable, tidak perlu tracking cooldown pairs
+// Node.js native fetch uses undici under the hood with a global connection pool.
+// When timeouts happen repeatedly, the connection pool can get "stuck".
+// This function resets the global dispatcher to force fresh connections.
 // ============================================================================
 
-/**
- * Get recipient untuk sender dalam one-directional ring
- * Sender di index i akan kirim ke index (i+1) % N
- * 
- * @param {string} senderName - Nama akun sender
- * @param {Array} sortedAccounts - Array akun yang sudah di-sort by name
- * @returns {Object|null} Recipient account atau null jika tidak ditemukan
- */
-function getRingRecipient(senderName, sortedAccounts) {
-  if (!Array.isArray(sortedAccounts) || sortedAccounts.length < 2) {
-    return null;
-  }
+let undiciAvailable = false;
+let undiciModule = null;
+let connectionPoolResetInFlight = null;
+let lastConnectionPoolResetAt = 0;
+const CONNECTION_POOL_RESET_MIN_INTERVAL_MS = 12000;
 
-  const senderIndex = sortedAccounts.findIndex((acc) => acc.name === senderName);
-  if (senderIndex === -1) {
-    return null;
-  }
-
-  // Always send to next account in ring (index + 1, wrapping around)
-  const recipientIndex = (senderIndex + 1) % sortedAccounts.length;
-  return sortedAccounts[recipientIndex];
+try {
+  undiciModule = require("undici");
+  undiciAvailable = true;
+} catch {
+  // undici not available as explicit dependency, will try global reset
 }
 
 /**
- * Build a single internal send request using one-directional ring strategy
- * This replaces the old buildInternalSendRequests (plural) function
- * 
- * @param {Array} accounts - All accounts array
- * @param {string} senderName - Name of sender account
- * @param {Object} sendPolicy - Send policy with randomAmount config
- * @returns {Object|null} Single send request or null if cannot send
+ * Reset the global fetch connection pool.
+ * This helps recover from "stuck" connections that cause repeated timeouts.
+ * After calling this, subsequent fetch requests will use fresh connections.
  */
-function buildInternalSendRequest(accounts, senderName, sendPolicy) {
-  // Filter accounts with valid addresses
-  const validAccounts = accounts.filter(
-    (acc) => String(acc.address || "").trim()
-  );
+async function resetConnectionPool(options = {}) {
+  const forceReset = Boolean(options.forceReset);
 
-  if (validAccounts.length < 2) {
-    console.log(
-      `[ring] Internal mode requires at least 2 accounts with valid addresses. ` +
-      `Found ${validAccounts.length} valid accounts.`
-    );
-    return null;
+  if (connectionPoolResetInFlight) {
+    console.log("[connection] Reset already in progress, waiting for existing reset...");
+    return connectionPoolResetInFlight;
   }
 
-  // Sort accounts by name for consistent ring order (no shuffle!)
-  const sortedAccounts = [...validAccounts].sort((a, b) =>
-    a.name.localeCompare(b.name)
-  );
-
-  // Get recipient using ring strategy
-  const recipient = getRingRecipient(senderName, sortedAccounts);
-  if (!recipient) {
-    console.log(`[ring] No recipient found for ${senderName}`);
-    return null;
+  const nowMs = Date.now();
+  const sinceLastResetMs = nowMs - lastConnectionPoolResetAt;
+  if (!forceReset && lastConnectionPoolResetAt > 0 && sinceLastResetMs < CONNECTION_POOL_RESET_MIN_INTERVAL_MS) {
+    const remainingSeconds = Math.max(1, Math.ceil((CONNECTION_POOL_RESET_MIN_INTERVAL_MS - sinceLastResetMs) / 1000));
+    console.log(`[connection] Reset skipped (throttled), retry window in ${remainingSeconds}s`);
+    return true;
   }
 
-  const amount = generateRandomCcAmount(sendPolicy.randomAmount);
+  if (forceReset) {
+    console.log("[connection] Force reset requested (bypass throttle)");
+  }
 
-  console.log(`[ring] ${senderName} -> ${recipient.name} (${amount} CC)`);
+  connectionPoolResetInFlight = (async () => {
+    console.log("[connection] Attempting to reset connection pool...");
 
-  return {
-    amount,
-    label: recipient.name,
-    address: recipient.address,
-    source: "internal-ring"
-  };
+    try {
+      if (undiciAvailable && undiciModule) {
+        // Create a new Agent with fresh settings
+        const newAgent = new undiciModule.Agent({
+          keepAliveTimeout: 10000,  // 10 seconds
+          keepAliveMaxTimeout: 30000,  // 30 seconds max
+          connections: 100,
+          pipelining: 1
+        });
+        undiciModule.setGlobalDispatcher(newAgent);
+        lastConnectionPoolResetAt = Date.now();
+        console.log("[connection] Connection pool reset via undici.setGlobalDispatcher()");
+        return true;
+      }
+
+      // Fallback: try to access undici through global symbol (Node.js 18+)
+      const dispatcherSymbol = Symbol.for("undici.globalDispatcher.1");
+      if (globalThis[dispatcherSymbol]) {
+        // Close existing connections
+        try {
+          const currentDispatcher = globalThis[dispatcherSymbol];
+          if (typeof currentDispatcher.close === "function") {
+            await currentDispatcher.close();
+            console.log("[connection] Closed existing dispatcher connections");
+          }
+        } catch (closeErr) {
+          const closeMessage = String(closeErr && closeErr.message ? closeErr.message : closeErr || "");
+          if (closeMessage.toLowerCase().includes("destroyed")) {
+            console.log("[connection] Dispatcher already destroyed, continuing with fresh reset");
+          } else {
+            console.log(`[connection] Could not close dispatcher: ${closeMessage}`);
+          }
+        }
+
+        // Force garbage collection if available (Node.js with --expose-gc)
+        if (typeof global.gc === "function") {
+          global.gc();
+          console.log("[connection] Forced garbage collection");
+        }
+
+        lastConnectionPoolResetAt = Date.now();
+        console.log("[connection] Connection pool soft reset completed");
+        return true;
+      }
+
+      console.log("[connection] No undici dispatcher found, connection pool not reset");
+      return false;
+    } catch (error) {
+      console.log(`[connection] Failed to reset connection pool: ${error.message}`);
+      return false;
+    }
+  })();
+
+  try {
+    return await connectionPoolResetInFlight;
+  } finally {
+    connectionPoolResetInFlight = null;
+  }
 }
 
 // ============================================================================
-// LEGACY PAIR TRACKING (Stub functions - ring strategy doesn't need these)
+// ADAPTIVE INTERNAL RECIPIENT STRATEGY
 // ============================================================================
-// These are kept for backward compatibility during transition
-// Ring strategy is one-directional, so no reciprocal pairs occur
+// Goals:
+// - Recipient tidak monoton (rotating offset per round)
+// - Hindari kirim balik langsung ke sender sebelumnya (server cooldown 10m)
+// - Tetap support fallback recipient saat candidate utama cooldown
+// ============================================================================
 
-const SEND_PAIR_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes (legacy reference)
-const sendPairHistory = new Map(); // Empty map for legacy references
+const SEND_PAIR_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
+const SEND_PAIR_COOLDOWN_BUFFER_SECONDS = 45; // Safety buffer near expiry
 
-function recordSendPair(senderName, recipientName) {
-  // No-op: Ring strategy doesn't need pair tracking
-  // Kept for backward compatibility with executeSendBatch
-}
+// key: "sender=>recipient", value: timestamp (ms) of successful send
+const sendPairHistory = new Map();
+// key: "sender=>recipient", value: block-until timestamp (ms)
+const reciprocalSendCooldowns = new Map();
 
-function isReciprocalPairInCooldown(senderName, recipientName) {
-  // Always return false: Ring strategy avoids reciprocal pairs by design
-  return false;
+let roundRobinOffset = 0;
+let lastRoundPrimaryOffset = 0;
+const cachedRoundOffsets = new Map();
+
+function buildSendPairKey(senderName, recipientName) {
+  return `${String(senderName || "").trim()}=>${String(recipientName || "").trim()}`;
 }
 
 function cleanupExpiredSendPairs() {
-  // No-op: Ring strategy doesn't use pair tracking
-  sendPairHistory.clear();
+  const nowMs = Date.now();
+
+  for (const [pairKey, timestamp] of sendPairHistory.entries()) {
+    if (!Number.isFinite(Number(timestamp))) {
+      sendPairHistory.delete(pairKey);
+      continue;
+    }
+
+    if (nowMs - Number(timestamp) > SEND_PAIR_COOLDOWN_MS) {
+      sendPairHistory.delete(pairKey);
+    }
+  }
+
+  for (const [pairKey, expiresAt] of reciprocalSendCooldowns.entries()) {
+    if (!Number.isFinite(Number(expiresAt)) || Number(expiresAt) <= nowMs) {
+      reciprocalSendCooldowns.delete(pairKey);
+    }
+  }
+}
+
+function getReciprocalCooldownSeconds(senderName, recipientName) {
+  const key = buildSendPairKey(senderName, recipientName);
+  const expiresAt = Number(reciprocalSendCooldowns.get(key));
+  if (!Number.isFinite(expiresAt)) {
+    return 0;
+  }
+
+  const remainingMs = expiresAt - Date.now();
+  if (remainingMs <= 0) {
+    reciprocalSendCooldowns.delete(key);
+    return 0;
+  }
+
+  return Math.max(1, Math.ceil(remainingMs / 1000) + SEND_PAIR_COOLDOWN_BUFFER_SECONDS);
+}
+
+function recordSendPair(senderName, recipientName) {
+  const sender = String(senderName || "").trim();
+  const recipient = String(recipientName || "").trim();
+  if (!sender || !recipient || sender === recipient) {
+    return;
+  }
+
+  const nowMs = Date.now();
+  const pairKey = buildSendPairKey(sender, recipient);
+  const reciprocalKey = buildSendPairKey(recipient, sender);
+
+  sendPairHistory.set(pairKey, nowMs);
+  reciprocalSendCooldowns.set(reciprocalKey, nowMs + SEND_PAIR_COOLDOWN_MS);
+}
+
+function isReciprocalPairInCooldown(senderName, recipientName) {
+  return getReciprocalCooldownSeconds(senderName, recipientName) > 0;
 }
 
 function getShortestReciprocalCooldownSeconds(senderName, sortedAccounts) {
-  // Always return 0: Ring strategy doesn't have reciprocal cooldowns
-  return 0;
+  if (!Array.isArray(sortedAccounts) || sortedAccounts.length === 0) {
+    return 0;
+  }
+
+  let shortest = 0;
+  for (const account of sortedAccounts) {
+    const recipientName = String(account && account.name ? account.name : "").trim();
+    if (!recipientName || recipientName === senderName) {
+      continue;
+    }
+
+    const cooldownSeconds = getReciprocalCooldownSeconds(senderName, recipientName);
+    if (cooldownSeconds <= 0) {
+      continue;
+    }
+
+    shortest = shortest === 0 ? cooldownSeconds : Math.min(shortest, cooldownSeconds);
+  }
+
+  return shortest;
 }
-
-// ============================================================================
-// ROUND ROBIN OFFSET (Legacy - kept for backward compatibility)
-// ============================================================================
-// These functions track round offsets but are not essential for ring strategy
-// Ring strategy uses fixed offset of 1 (next account in sorted list)
-
-let roundRobinOffset = 0;
 
 function getRoundRobinOffset() {
   return roundRobinOffset;
 }
 
-function getRotatingOffset(totalAccounts) {
-  // Ring strategy always uses offset 1 (next in line)
-  // This function is kept for backward compatibility
-  return 1;
+function getRotatingOffset(totalAccounts, loopRound = null) {
+  const normalizedTotal = clampToNonNegativeInt(totalAccounts, 0);
+  if (normalizedTotal < 2) {
+    return 1;
+  }
+
+  const maxOffset = normalizedTotal - 1;
+  const roundSeed = Number.isFinite(Number(loopRound))
+    ? Math.max(1, clampToNonNegativeInt(loopRound, 1))
+    : Math.max(1, clampToNonNegativeInt(getRoundRobinOffset(), 1));
+  const cacheKey = `${normalizedTotal}:${roundSeed}`;
+  const cachedOffset = Number(cachedRoundOffsets.get(cacheKey));
+  if (Number.isFinite(cachedOffset) && cachedOffset > 0) {
+    return cachedOffset;
+  }
+
+  let selectedOffset = ((roundSeed - 1) % maxOffset) + 1;
+
+  // Avoid immediate inverse mapping vs previous round whenever possible.
+  if (maxOffset > 1 && lastRoundPrimaryOffset > 0) {
+    const inverseOffset = (normalizedTotal - (lastRoundPrimaryOffset % normalizedTotal)) % normalizedTotal;
+    if (inverseOffset > 0 && selectedOffset === inverseOffset) {
+      selectedOffset = (selectedOffset % maxOffset) + 1;
+    }
+  }
+
+  cachedRoundOffsets.set(cacheKey, selectedOffset);
+  lastRoundPrimaryOffset = selectedOffset;
+  return selectedOffset;
+}
+
+function buildInternalOffsetPriority(totalAccounts, primaryOffset) {
+  const normalizedTotal = clampToNonNegativeInt(totalAccounts, 0);
+  const maxOffset = normalizedTotal - 1;
+  if (maxOffset < 1) {
+    return [];
+  }
+
+  const safePrimary = Math.min(
+    maxOffset,
+    Math.max(1, clampToNonNegativeInt(primaryOffset, 1))
+  );
+
+  const offsets = [];
+  const selfInverseOffset = normalizedTotal % 2 === 0 ? normalizedTotal / 2 : 0;
+  for (let step = 0; step < maxOffset; step += 1) {
+    const offset = ((safePrimary - 1 + step) % maxOffset) + 1;
+    if (maxOffset > 1 && selfInverseOffset > 0 && offset === selfInverseOffset) {
+      continue;
+    }
+    offsets.push(offset);
+  }
+
+  if (offsets.length === 0) {
+    offsets.push(safePrimary);
+  }
+  return offsets;
 }
 
 function incrementRoundRobinOffset() {
@@ -162,6 +330,135 @@ function incrementRoundRobinOffset() {
 
 function resetRoundRobinOffset() {
   roundRobinOffset = 0;
+  lastRoundPrimaryOffset = 0;
+  cachedRoundOffsets.clear();
+}
+
+/**
+ * Build internal send candidates using rotating offsets + reciprocal cooldown guard.
+ * The first candidate is primary target; remaining entries are fallback recipients.
+ */
+function buildInternalSendRequests(
+  accounts,
+  senderName,
+  sendPolicy,
+  loopRound = null,
+  avoidRecipientNames = []
+) {
+  const validAccounts = Array.isArray(accounts)
+    ? accounts.filter((acc) => String(acc && acc.address ? acc.address : "").trim())
+    : [];
+  const avoidRecipientsSet = new Set(
+    Array.isArray(avoidRecipientNames)
+      ? avoidRecipientNames
+          .map((item) => String(item || "").trim())
+          .filter((item) => Boolean(item))
+      : []
+  );
+
+  if (validAccounts.length < 2) {
+    console.log(
+      `[internal] Internal mode requires at least 2 accounts with valid addresses. ` +
+      `Found ${validAccounts.length} valid accounts.`
+    );
+    return {
+      requests: [],
+      reason: "not-enough-accounts",
+      retryAfterSeconds: 0,
+      primaryOffset: 1
+    };
+  }
+
+  const sortedAccounts = [...validAccounts].sort((a, b) => a.name.localeCompare(b.name));
+  const senderIndex = sortedAccounts.findIndex((acc) => acc.name === senderName);
+  if (senderIndex === -1) {
+    console.log(`[internal] Sender ${senderName} not found in sorted account list`);
+    return {
+      requests: [],
+      reason: "sender-not-found",
+      retryAfterSeconds: 0,
+      primaryOffset: 1
+    };
+  }
+
+  cleanupExpiredSendPairs();
+
+  const primaryOffset = getRotatingOffset(sortedAccounts.length, loopRound);
+  const offsetPriority = buildInternalOffsetPriority(sortedAccounts.length, primaryOffset);
+  const amount = generateRandomCcAmount(sendPolicy.randomAmount);
+  const requests = [];
+  let shortestBlockedCooldownSeconds = 0;
+  let skippedByAvoidCount = 0;
+
+  for (const offset of offsetPriority) {
+    const recipientIndex = (senderIndex + offset) % sortedAccounts.length;
+    const recipient = sortedAccounts[recipientIndex];
+    if (!recipient || recipient.name === senderName) {
+      continue;
+    }
+
+    if (avoidRecipientsSet.has(recipient.name)) {
+      skippedByAvoidCount += 1;
+      continue;
+    }
+
+    const reciprocalCooldownSeconds = getReciprocalCooldownSeconds(senderName, recipient.name);
+    if (reciprocalCooldownSeconds > 0) {
+      shortestBlockedCooldownSeconds = shortestBlockedCooldownSeconds === 0
+        ? reciprocalCooldownSeconds
+        : Math.min(shortestBlockedCooldownSeconds, reciprocalCooldownSeconds);
+      continue;
+    }
+
+    requests.push({
+      amount,
+      label: recipient.name,
+      address: recipient.address,
+      source: "internal-rotating",
+      offset,
+      internalRecipientCandidate: true
+    });
+  }
+
+  if (requests.length === 0) {
+    const shortestCooldownSeconds =
+      shortestBlockedCooldownSeconds > 0
+        ? shortestBlockedCooldownSeconds
+        : getShortestReciprocalCooldownSeconds(senderName, sortedAccounts);
+    const sendBackGuardSeconds = Math.ceil(SEND_PAIR_COOLDOWN_MS / 1000);
+    const hasAvoidOnlyBlock = skippedByAvoidCount > 0 && shortestCooldownSeconds <= 0;
+    const retryAfterSeconds = hasAvoidOnlyBlock
+      ? sendBackGuardSeconds
+      : (shortestCooldownSeconds || 0);
+    const reason = hasAvoidOnlyBlock
+      ? "internal-avoid-sendback"
+      : "internal-reciprocal-cooldown";
+    console.log(
+      `[internal] ${senderName}: no eligible recipient. ` +
+      `cooldownRetry=${shortestCooldownSeconds || 0}s avoidBlocked=${skippedByAvoidCount} ` +
+      `(retryAfter=${retryAfterSeconds}s reason=${reason})`
+    );
+    return {
+      requests: [],
+      reason,
+      retryAfterSeconds,
+      primaryOffset
+    };
+  }
+
+  const preview = requests.slice(0, 4).map((entry) => entry.label).join(", ");
+  const suffix = requests.length > 4 ? ` (+${requests.length - 4} more)` : "";
+  console.log(
+    `[internal] ${senderName}: offset=${primaryOffset} candidates=${requests.length}/${offsetPriority.length} ` +
+    `primary=${requests[0].label} | pool=[${preview}${suffix}]`
+  );
+
+  return {
+    requests,
+    reason: null,
+    retryAfterSeconds: 0,
+    primaryOffset
+  };
 }
 
 // ============================================================================
@@ -251,6 +548,7 @@ const INTERNAL_API_DEFAULTS = {
     minDelayTxSeconds: 120,
     maxDelayTxSeconds: 120,
     delayCycleSeconds: 300,
+    sequentialAllRounds: true,
     randomAmount: {
       enabled: false,
       min: "0.10",
@@ -260,7 +558,7 @@ const INTERNAL_API_DEFAULTS = {
   },
   ui: {
     dashboard: true,
-    logLines: 12
+    logLines: 20
   }
 };
 
@@ -271,7 +569,10 @@ function getTimeStamp() {
 class PinnedDashboard {
   constructor({ enabled, logLines, accountSnapshots }) {
     this.enabled = Boolean(enabled && process.stdout.isTTY);
-    this.logLines = Math.max(1, clampToNonNegativeInt(logLines, INTERNAL_API_DEFAULTS.ui.logLines));
+    this.logLines = Math.min(
+      20,
+      Math.max(1, clampToNonNegativeInt(logLines, INTERNAL_API_DEFAULTS.ui.logLines))
+    );
     this.logs = [];
     this.accountSnapshots = isObject(accountSnapshots) ? accountSnapshots : {};
     this.state = {
@@ -1400,6 +1701,33 @@ function isTimeoutError(error) {
   );
 }
 
+function isTransientSendFlowError(error) {
+  if (!error) {
+    return false;
+  }
+
+  if (isSendEligibilityDelayError(error)) {
+    return false;
+  }
+
+  const status = Number(error && error.status);
+  if (status === 429 || (status >= 500 && status < 600)) {
+    return true;
+  }
+
+  const message = String(error && error.message ? error.message : error || "").toLowerCase();
+  return (
+    isTimeoutError(error) ||
+    message.includes("fetch failed") ||
+    message.includes("network") ||
+    message.includes("socket") ||
+    message.includes("econnreset") ||
+    message.includes("eai_again") ||
+    message.includes("connection") ||
+    message.includes("terminated")
+  );
+}
+
 function isSendEligibilityDelayError(error) {
   const status = Number(error && error.status);
   if (status === 409 || status === 423) {
@@ -1415,6 +1743,58 @@ function isSendEligibilityDelayError(error) {
     message.includes("temporarily unavailable") ||
     (message.includes("recent") && message.includes("send"))
   );
+}
+
+function isBalanceContractFragmentationError(error) {
+  const status = Number(error && error.status);
+  const message = String(error && error.message ? error.message : error || "").toLowerCase();
+
+  if (status !== 400) {
+    return false;
+  }
+
+  return (
+    message.includes("split across too many contracts") ||
+    (message.includes("too many contracts") && message.includes("would be needed")) ||
+    (message.includes("contracts") && message.includes("one transaction"))
+  );
+}
+
+function getReducedAmountForFragmentedBalance(currentAmount, sendPolicy) {
+  const current = Number(currentAmount);
+  if (!Number.isFinite(current) || current <= 0) {
+    return null;
+  }
+
+  const randomAmount = isObject(sendPolicy && sendPolicy.randomAmount)
+    ? sendPolicy.randomAmount
+    : null;
+  const decimals = Math.min(
+    8,
+    Math.max(
+      0,
+      clampToNonNegativeInt(
+        randomAmount && Object.prototype.hasOwnProperty.call(randomAmount, "decimals")
+          ? randomAmount.decimals
+          : 3,
+        3
+      )
+    )
+  );
+
+  const emergencyFloor = 0.1;
+  const reducedRaw = current * 0.6;
+  const candidate = Math.max(emergencyFloor, reducedRaw);
+  if (!(candidate > 0) || candidate >= current) {
+    return null;
+  }
+
+  const rounded = Number(candidate.toFixed(decimals));
+  if (!Number.isFinite(rounded) || rounded <= 0 || rounded >= current) {
+    return null;
+  }
+
+  return normalizeCcAmount(rounded.toFixed(decimals));
 }
 
 function parseRetryAfterSeconds(errorLike, fallbackSeconds = 15) {
@@ -1512,6 +1892,34 @@ function normalizeConfig(rawConfig) {
       1,
       clampToNonNegativeInt(sessionInput.maxSessionReuseRefreshAttempts, 3)
     ),
+    maxSessionReuseTransientAttempts: Math.max(
+      1,
+      clampToNonNegativeInt(sessionInput.maxSessionReuseTransientAttempts, 6)
+    ),
+    maxSessionReuseLightResets: Math.max(
+      0,
+      clampToNonNegativeInt(sessionInput.maxSessionReuseLightResets, 1)
+    ),
+    maxSessionReuseTransientBrowserRefreshes: Math.max(
+      0,
+      clampToNonNegativeInt(sessionInput.maxSessionReuseTransientBrowserRefreshes, 0)
+    ),
+    sessionReuseTransientRetryAfterSeconds: Math.max(
+      15,
+      clampToNonNegativeInt(sessionInput.sessionReuseTransientRetryAfterSeconds, 45)
+    ),
+    browserChallengeRetryAfterSeconds: Math.max(
+      60,
+      clampToNonNegativeInt(sessionInput.browserChallengeRetryAfterSeconds, 120)
+    ),
+    sessionReuseRetryJitterSeconds: Math.max(
+      0,
+      clampToNonNegativeInt(sessionInput.sessionReuseRetryJitterSeconds, 12)
+    ),
+    maxConcurrentSessionReuse: Math.max(
+      1,
+      clampToNonNegativeInt(sessionInput.maxConcurrentSessionReuse, 1)
+    ),
     checkpointSettleDelayMs: Math.max(
       500,
       clampToNonNegativeInt(sessionInput.checkpointSettleDelayMs, 3500)
@@ -1543,9 +1951,12 @@ function normalizeConfig(rawConfig) {
       typeof uiInput.dashboard === "boolean"
         ? uiInput.dashboard
         : INTERNAL_API_DEFAULTS.ui.dashboard,
-    logLines: Math.max(
-      1,
-      clampToNonNegativeInt(uiLogLinesInput, INTERNAL_API_DEFAULTS.ui.logLines)
+    logLines: Math.min(
+      20,
+      Math.max(
+        1,
+        clampToNonNegativeInt(uiLogLinesInput, INTERNAL_API_DEFAULTS.ui.logLines)
+      )
     )
   };
 
@@ -1636,11 +2047,21 @@ function normalizeConfig(rawConfig) {
     "config.send.randomAmount"
   );
 
+  const sequentialAllRounds =
+    typeof sendInput.sequentialAllRounds === "boolean"
+      ? sendInput.sequentialAllRounds
+      : (
+          typeof sendInput.parallelEnabled === "boolean"
+            ? !sendInput.parallelEnabled
+            : INTERNAL_API_DEFAULTS.send.sequentialAllRounds
+        );
+
   const send = {
     maxLoopTx,
     minDelayTxSeconds,
     maxDelayTxSeconds,
     delayCycleSeconds,
+    sequentialAllRounds,
     randomAmount
   };
 
@@ -1747,28 +2168,218 @@ async function promptOtpCode() {
   }
 }
 
+async function acquireBrowserChallengeSlot() {
+  if (activeBrowserChallenges < BROWSER_CHALLENGE_MAX_CONCURRENT) {
+    activeBrowserChallenges += 1;
+    console.log(
+      `[browser-queue] Slot acquired (${activeBrowserChallenges}/${BROWSER_CHALLENGE_MAX_CONCURRENT})`
+    );
+    return;
+  }
+
+  const queuePosition = browserChallengeWaitQueue.length + 1;
+  const queuedAt = Date.now();
+  console.log(
+    `[browser-queue] Challenge queued (position ${queuePosition}), ` +
+      `active=${activeBrowserChallenges}/${BROWSER_CHALLENGE_MAX_CONCURRENT}`
+  );
+
+  await new Promise((resolve) => {
+    browserChallengeWaitQueue.push(resolve);
+  });
+
+  const waitedSeconds = Math.max(1, Math.round((Date.now() - queuedAt) / 1000));
+  console.log(
+    `[browser-queue] Slot acquired after waiting ${waitedSeconds}s ` +
+      `(${activeBrowserChallenges}/${BROWSER_CHALLENGE_MAX_CONCURRENT})`
+  );
+}
+
+function applySessionReuseConcurrencyLimit(limitCandidate) {
+  const parsed = clampToNonNegativeInt(limitCandidate, SESSION_REUSE_MAX_CONCURRENT);
+  SESSION_REUSE_MAX_CONCURRENT = Math.max(1, parsed);
+}
+
+async function acquireSessionReuseSlot(accountLogTag = null) {
+  const prefix = accountLogTag ? `[${accountLogTag}] ` : "";
+
+  if (activeSessionReuseChallenges < SESSION_REUSE_MAX_CONCURRENT) {
+    activeSessionReuseChallenges += 1;
+    console.log(
+      `${prefix}[session-queue] Slot acquired (${activeSessionReuseChallenges}/${SESSION_REUSE_MAX_CONCURRENT})`
+    );
+    return;
+  }
+
+  const queuePosition = sessionReuseWaitQueue.length + 1;
+  const queuedAt = Date.now();
+  console.log(
+    `${prefix}[session-queue] Session reuse queued (position ${queuePosition}), ` +
+      `active=${activeSessionReuseChallenges}/${SESSION_REUSE_MAX_CONCURRENT}`
+  );
+
+  await new Promise((resolve) => {
+    sessionReuseWaitQueue.push(resolve);
+  });
+
+  const waitedSeconds = Math.max(1, Math.round((Date.now() - queuedAt) / 1000));
+  console.log(
+    `${prefix}[session-queue] Slot acquired after waiting ${waitedSeconds}s ` +
+      `(${activeSessionReuseChallenges}/${SESSION_REUSE_MAX_CONCURRENT})`
+  );
+}
+
+function releaseSessionReuseSlot(accountLogTag = null) {
+  const prefix = accountLogTag ? `[${accountLogTag}] ` : "";
+
+  if (activeSessionReuseChallenges > 0) {
+    activeSessionReuseChallenges -= 1;
+  }
+
+  const next = sessionReuseWaitQueue.shift();
+  if (next) {
+    activeSessionReuseChallenges += 1;
+    next();
+  }
+
+  console.log(
+    `${prefix}[session-queue] Slot released ` +
+      `(active=${activeSessionReuseChallenges}/${SESSION_REUSE_MAX_CONCURRENT}, queue=${sessionReuseWaitQueue.length})`
+  );
+}
+
+function releaseBrowserChallengeSlot() {
+  if (activeBrowserChallenges > 0) {
+    activeBrowserChallenges -= 1;
+  }
+
+  const next = browserChallengeWaitQueue.shift();
+  if (next) {
+    activeBrowserChallenges += 1;
+    next();
+  }
+
+  console.log(
+    `[browser-queue] Slot released ` +
+      `(active=${activeBrowserChallenges}/${BROWSER_CHALLENGE_MAX_CONCURRENT}, queue=${browserChallengeWaitQueue.length})`
+  );
+}
+
+function isSecurityCookieName(name) {
+  const normalized = String(name || "").trim().toLowerCase();
+  return normalized === "_vcrcs" || normalized.startsWith("_vc");
+}
+
+function cacheSecurityCookiesFromMap(cookieMap, sourceLabel = "unknown") {
+  if (!(cookieMap instanceof Map)) {
+    return 0;
+  }
+
+  let updated = 0;
+  for (const [name, value] of cookieMap.entries()) {
+    if (!isSecurityCookieName(name)) {
+      continue;
+    }
+
+    const key = String(name || "").trim();
+    const val = String(value || "").trim();
+    if (!key || !val) {
+      continue;
+    }
+
+    const previousValue = cachedSecurityCookies.get(key);
+    if (previousValue !== val) {
+      cachedSecurityCookies.set(key, val);
+      updated += 1;
+    }
+  }
+
+  if (updated > 0) {
+    console.log(`[cookie-cache] Updated ${updated} security cookie(s) from ${sourceLabel}`);
+  }
+
+  return updated;
+}
+
+function buildCachedSecurityCookieMap() {
+  return new Map(cachedSecurityCookies);
+}
+
+async function readAllBrowserCookies(page) {
+  const merged = new Map();
+
+  try {
+    const pageCookies = await page.cookies();
+    for (const cookie of pageCookies) {
+      if (cookie && cookie.name) {
+        merged.set(cookie.name, cookie.value);
+      }
+    }
+  } catch (error) {
+    console.log(`[browser] page.cookies() issue: ${error.message}`);
+  }
+
+  try {
+    const contextCookies = await page.browserContext().cookies();
+    for (const cookie of contextCookies) {
+      if (cookie && cookie.name) {
+        merged.set(cookie.name, cookie.value);
+      }
+    }
+  } catch (error) {
+    console.log(`[browser] browserContext.cookies() issue: ${error.message}`);
+  }
+
+  return Array.from(merged.entries()).map(([name, value]) => ({ name, value }));
+}
+
+function getBrowserChallengeCooldownRemainingSeconds() {
+  if (!Number.isFinite(browserChallengeRateLimitedUntilMs) || browserChallengeRateLimitedUntilMs <= 0) {
+    return 0;
+  }
+
+  const remainingMs = browserChallengeRateLimitedUntilMs - Date.now();
+  if (remainingMs <= 0) {
+    browserChallengeRateLimitedUntilMs = 0;
+    return 0;
+  }
+
+  return Math.max(1, Math.ceil(remainingMs / 1000));
+}
+
+function markBrowserChallengeRateLimited(cooldownSeconds = 120) {
+  const boundedSeconds = Math.max(30, clampToNonNegativeInt(cooldownSeconds, 120));
+  const nextUntilMs = Date.now() + (boundedSeconds * 1000);
+  browserChallengeRateLimitedUntilMs = Math.max(browserChallengeRateLimitedUntilMs, nextUntilMs);
+  console.log(`[browser] Rate-limit cooldown armed for ${boundedSeconds}s`);
+}
+
 async function solveBrowserChallenge(baseUrl, onboardPath, userAgent, headless = true) {
   if (!puppeteer) {
     throw new Error("Puppeteer is not installed. Run: npm install puppeteer-extra puppeteer-extra-plugin-stealth");
   }
 
-  console.log("[browser] Launching browser to solve Vercel challenge...");
-  console.log("[browser] Mode: " + (headless ? "headless" : "visible"));
-
-  const browser = await puppeteer.launch({
-    headless: headless,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-blink-features=AutomationControlled",
-      "--disable-infobars",
-      "--disable-dev-shm-usage",
-      "--window-size=1280,800"
-    ],
-    defaultViewport: null
-  });
-
+  await acquireBrowserChallengeSlot();
+  let browser = null;
   try {
+    console.log("[browser] Launching browser to solve Vercel challenge...");
+    console.log("[browser] Mode: " + (headless ? "headless" : "visible"));
+    console.log(`[browser] Launch timeout: ${Math.round(BROWSER_LAUNCH_TIMEOUT_MS / 1000)}s`);
+
+    browser = await puppeteer.launch({
+      headless: headless,
+      timeout: BROWSER_LAUNCH_TIMEOUT_MS,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-infobars",
+        "--disable-dev-shm-usage",
+        "--window-size=1280,800"
+      ],
+      defaultViewport: null
+    });
+
     const page = await browser.newPage();
 
     // Keep browser challenge fingerprint close to API requests.
@@ -1793,10 +2404,17 @@ async function solveBrowserChallenge(baseUrl, onboardPath, userAgent, headless =
 
     const status = response ? response.status() : 0;
     console.log(`[browser] Initial response status: ${status}`);
+    const probeAttempts = status === 429
+      ? BROWSER_CHALLENGE_MAX_ATTEMPTS_ON_429
+      : BROWSER_CHALLENGE_MAX_ATTEMPTS;
+
+    if (status === 429) {
+      console.log(`[browser] 429 detected, using 429 challenge mode ( checks).`);
+    }
 
     console.log("[browser] Waiting for Vercel challenge to resolve...");
 
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < probeAttempts; i++) {
       await sleep(2000);
       const currentUrl = page.url();
       const cookies = await page.cookies();
@@ -1818,7 +2436,36 @@ async function solveBrowserChallenge(baseUrl, onboardPath, userAgent, headless =
     console.log("[browser] Final cookie extraction...");
     await sleep(1000);
 
-    const cookies = await page.cookies();
+    let cookies = await page.cookies();
+
+    if (cookies.length === 0 && status === 429) {
+      console.log(
+        `[browser] Still no cookies after challenge on HTTP 429. ` +
+          `Cooling down ${Math.round(BROWSER_CHALLENGE_RETRY_DELAY_MS / 1000)}s then running quick retry...`
+      );
+      await sleep(BROWSER_CHALLENGE_RETRY_DELAY_MS);
+
+      try {
+        await page.reload({
+          waitUntil: "domcontentloaded",
+          timeout: 30000
+        });
+      } catch (reloadError) {
+        console.log(`[browser] Reload issue after 429: ${reloadError.message}`);
+      }
+
+      for (let i = 0; i < BROWSER_CHALLENGE_RETRY_ATTEMPTS_ON_429; i += 1) {
+        await sleep(2000);
+        cookies = await page.cookies();
+        const hasVercelCookie = cookies.some((cookie) => String(cookie.name || "").startsWith("_vc"));
+        console.log(`[browser] Retry attempt ${i + 1}: ${cookies.length} cookies`);
+        if (hasVercelCookie || cookies.length > 0) {
+          console.log("[browser] Cookies detected after 429 retry.");
+          break;
+        }
+      }
+    }
+
     console.log(`[browser] Extracted ${cookies.length} cookies:`);
 
     const cookieMap = new Map();
@@ -1828,10 +2475,22 @@ async function solveBrowserChallenge(baseUrl, onboardPath, userAgent, headless =
       console.log(`[browser]   ${cookie.name}=${valuePreview}`);
     }
 
+    cacheSecurityCookiesFromMap(cookieMap, "browser-challenge");
+
     return cookieMap;
   } finally {
-    await browser.close();
-    console.log("[browser] Browser closed");
+    if (browser) {
+      try {
+        await browser.close();
+        console.log("[browser] Browser closed");
+      } catch (closeError) {
+        const closeMessage = String(
+          closeError && closeError.message ? closeError.message : closeError || "unknown"
+        );
+        console.log(`[browser] Browser close warning: ${closeMessage}`);
+      }
+    }
+    releaseBrowserChallengeSlot();
   }
 }
 
@@ -2102,6 +2761,7 @@ class RootsFiApiClient {
 
     let lastError = null;
     let attempt = 0;
+    let consecutiveTimeouts = 0;
 
     while (true) {
       attempt += 1;
@@ -2117,6 +2777,9 @@ class RootsFiApiClient {
         });
 
         clearTimeout(timeoutId);
+        
+        // Reset consecutive timeout counter on success
+        consecutiveTimeouts = 0;
 
         this.parseSetCookieHeaders(response.headers);
 
@@ -2165,17 +2828,32 @@ class RootsFiApiClient {
         clearTimeout(timeoutId);
         lastError = error;
 
-        // TIMEOUT errors: infinite retry dengan exponential backoff
+        // TIMEOUT errors: retry dengan exponential backoff, tapi limit consecutive timeouts
         // UNLESS skipInfiniteTimeoutRetry is set (for non-critical endpoints)
         if (isTimeoutError(error)) {
           if (skipInfiniteTimeoutRetry) {
             // For non-critical endpoints, just throw timeout error immediately
             throw error;
           }
+          
+          consecutiveTimeouts += 1;
+          
+          // Check if we've hit max consecutive timeouts - trigger soft restart
+          if (consecutiveTimeouts >= TIMEOUT_MAX_CONSECUTIVE) {
+            console.log(
+              `[timeout-retry] ${method} ${endpointPath} hit ${consecutiveTimeouts} consecutive timeouts. ` +
+              `Triggering SOFT RESTART for this account...`
+            );
+            throw new SoftRestartError(
+              `Max consecutive timeouts (${TIMEOUT_MAX_CONSECUTIVE}) reached for ${method} ${endpointPath}`,
+              consecutiveTimeouts
+            );
+          }
+          
           const backoffMs = calculateTimeoutBackoffMs(attempt);
           const backoffSec = Math.round(backoffMs / 1000);
           console.log(
-            `[timeout-retry] ${method} ${endpointPath} timed out (attempt ${attempt}). ` +
+            `[timeout-retry] ${method} ${endpointPath} timed out (attempt ${attempt}, consecutive: ${consecutiveTimeouts}/${TIMEOUT_MAX_CONSECUTIVE}). ` +
             `Retrying in ${backoffSec}s (max: ${TIMEOUT_BACKOFF_MAX_MS / 1000}s)...`
           );
           await sleep(backoffMs);
@@ -2296,7 +2974,9 @@ class RootsFiApiClient {
   async sendCcTransfer(recipient, amount, idempotencyKey) {
     return this.requestJson("POST", this.paths.sendTransfer, {
       refererPath: this.paths.send,
-      timeoutMs: 90000,
+      timeoutMs: 60000,
+      // Let upper-layer send flow perform web-like refresh recovery on timeout.
+      skipInfiniteTimeoutRetry: true,
       body: {
         recipientType: "canton_wallet",
         recipient,
@@ -2470,6 +3150,17 @@ const API_CALL_MAX_RETRIES = 2;
 const TIMEOUT_BACKOFF_BASE_MS = 5000;       // 5 detik base delay
 const TIMEOUT_BACKOFF_MAX_MS = 300000;      // 5 menit max delay
 const TIMEOUT_BACKOFF_JITTER_MS = 30000;    // 0-30 detik random jitter
+const TIMEOUT_MAX_CONSECUTIVE = 5;          // Max consecutive timeouts before soft restart
+
+// Custom error class for soft restart
+class SoftRestartError extends Error {
+  constructor(message, consecutiveTimeouts) {
+    super(message);
+    this.name = "SoftRestartError";
+    this.consecutiveTimeouts = consecutiveTimeouts;
+    this.isSoftRestart = true;
+  }
+}
 
 function calculateTimeoutBackoffMs(attempt) {
   // Exponential backoff: 5s, 10s, 20s, 40s, 80s, 160s, 300s (capped)
@@ -2494,9 +3185,20 @@ async function apiCallWithTimeout(apiCall, label, timeoutMs = API_CALL_TIMEOUT_M
   return result;
 }
 
-async function apiCallWithRetry(apiCall, label, maxRetries = API_CALL_MAX_RETRIES, timeoutMs = API_CALL_TIMEOUT_MS) {
+async function apiCallWithRetry(
+  apiCall,
+  label,
+  maxRetries = API_CALL_MAX_RETRIES,
+  timeoutMs = API_CALL_TIMEOUT_MS,
+  options = {}
+) {
   let lastError = null;
   let attempt = 0;
+  let consecutiveTimeouts = 0;
+  const maxConsecutiveTimeouts = Math.max(
+    1,
+    clampToNonNegativeInt(options.maxConsecutiveTimeouts, TIMEOUT_MAX_CONSECUTIVE)
+  );
 
   while (true) {
     attempt += 1;
@@ -2506,20 +3208,38 @@ async function apiCallWithRetry(apiCall, label, maxRetries = API_CALL_MAX_RETRIE
         ? `${label} (timeout retry ${attempt})`
         : `${label} (attempt ${attempt}/${maxRetries})`;
 
-      return await apiCallWithTimeout(apiCall, attemptLabel, timeoutMs);
+      const result = await apiCallWithTimeout(apiCall, attemptLabel, timeoutMs);
+      
+      // Reset consecutive timeout counter on success
+      consecutiveTimeouts = 0;
+      return result;
     } catch (error) {
       lastError = error;
 
-      // TIMEOUT errors: infinite retry dengan exponential backoff
+      // TIMEOUT errors: retry dengan exponential backoff, tapi limit consecutive timeouts
       if (isTimeoutError(error)) {
+        consecutiveTimeouts += 1;
+        
+        // Check if we've hit max consecutive timeouts - trigger soft restart
+        if (consecutiveTimeouts >= maxConsecutiveTimeouts) {
+          console.log(
+            `[timeout-retry] ${label} hit ${consecutiveTimeouts} consecutive timeouts. ` +
+            `Triggering SOFT RESTART for this account...`
+          );
+          throw new SoftRestartError(
+            `Max consecutive timeouts (${maxConsecutiveTimeouts}) reached for ${label}`,
+            consecutiveTimeouts
+          );
+        }
+        
         const backoffMs = calculateTimeoutBackoffMs(attempt);
         const backoffSec = Math.round(backoffMs / 1000);
         console.log(
-          `[timeout-retry] ${label} timed out (attempt ${attempt}). ` +
+          `[timeout-retry] ${label} timed out (attempt ${attempt}, consecutive: ${consecutiveTimeouts}/${maxConsecutiveTimeouts}). ` +
           `Retrying in ${backoffSec}s (max: ${TIMEOUT_BACKOFF_MAX_MS / 1000}s)...`
         );
         await sleep(backoffMs);
-        continue; // infinite retry untuk timeout
+        continue;
       }
 
       // Non-timeout errors: gunakan maxRetries normal
@@ -2540,7 +3260,72 @@ async function apiCallWithRetry(apiCall, label, maxRetries = API_CALL_MAX_RETRIE
   }
 }
 
-async function executeCcSendFlow(client, sendRequest, accountLogTag = null) {
+async function recoverSendFlowByRefresh(
+  client,
+  config,
+  onCheckpointRefresh,
+  accountLogTag,
+  recoveryAttempt,
+  maxRecoveryAttempts,
+  options = {}
+) {
+  const recoveryMode = String(options.mode || "light").toLowerCase();
+  const reasonLabel = String(options.reason || "send-flow-transient");
+  const withBrowserRefresh = recoveryMode === "full-browser";
+  const forceConnectionReset = Boolean(options.forceConnectionReset);
+  const runPreflight =
+    typeof options.runPreflight === "boolean"
+      ? options.runPreflight
+      : withBrowserRefresh;
+  const taggedLog = (message) => console.log(withAccountTag(accountLogTag, message));
+  taggedLog(
+    `[send-recovery] ${reasonLabel} ${recoveryAttempt}/${maxRecoveryAttempts}: ` +
+      (withBrowserRefresh ? "reset connection + browser refresh" : "light reset (no browser)")
+  );
+
+  await resetConnectionPool({ forceReset: forceConnectionReset });
+
+  if (withBrowserRefresh && config.session.autoRefreshCheckpoint === false) {
+    taggedLog("[send-recovery] Browser refresh is disabled in config. Using connection reset only.");
+  } else if (withBrowserRefresh) {
+    try {
+      const browserCookies = await solveBrowserChallenge(
+        config.baseUrl,
+        config.paths.onboard,
+        config.headers.userAgent,
+        true
+      );
+      client.mergeCookies(browserCookies);
+      if (typeof onCheckpointRefresh === "function") {
+        onCheckpointRefresh();
+      }
+      client.logCookieStatus("after send-recovery browser refresh");
+    } catch (error) {
+      taggedLog(`[warn] Send recovery browser refresh failed: ${error.message}`);
+    }
+  }
+
+  if (runPreflight) {
+    try {
+      await client.preflightOnboard();
+      taggedLog("[send-recovery] Preflight check completed");
+    } catch (error) {
+      taggedLog(`[warn] Send recovery preflight failed: ${error.message}`);
+    }
+  } else {
+    taggedLog("[send-recovery] Skipping preflight in light mode");
+  }
+
+  const settleDelayMs = runPreflight
+    ? Math.max(
+        1000,
+        clampToNonNegativeInt(config.session.checkpointSettleDelayMs, 3500)
+      )
+    : 2000;
+  await sleep(settleDelayMs);
+}
+
+async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefresh, accountLogTag = null) {
   const stepLog = (message) => console.log(withAccountTag(accountLogTag, message));
 
   console.log(`[send] Target (${sendRequest.source}): ${sendRequest.label}`);
@@ -2601,8 +3386,11 @@ async function executeCcSendFlow(client, sendRequest, accountLogTag = null) {
     console.log("[info] Continuing with transfer anyway...");
   }
 
-  // Step 4: Transfer CC with retry
-  const idempotencyKey = sendRequest.idempotencyKey || crypto.randomUUID();
+  // Step 4: Transfer CC with timeout recovery (web-like refresh + retry)
+  if (!sendRequest.idempotencyKey) {
+    sendRequest.idempotencyKey = crypto.randomUUID();
+  }
+  const idempotencyKey = sendRequest.idempotencyKey;
   stepLog(`[step] Transfer CC (idempotencyKey=${idempotencyKey})`);
 
   let transferResponse = null;
@@ -2611,15 +3399,25 @@ async function executeCcSendFlow(client, sendRequest, accountLogTag = null) {
       () => client.sendCcTransfer(sendRequest.address, sendRequest.amount, idempotencyKey),
       "Transfer CC",
       API_CALL_MAX_RETRIES,
-      60000 // 60s timeout for transfer (longer)
+      75000,
+      {
+        // Timeout transfer should restart account immediately without timeout backoff delay.
+        maxConsecutiveTimeouts: 1
+      }
     );
   } catch (error) {
-    const message = String(error && error.message ? error.message : "").toLowerCase();
-    if (message.includes("timeout")) {
-      console.log("[warn] Transfer request timed out after all retries, checking history...");
-    } else {
+    if (error && error.isSoftRestart) {
       throw error;
     }
+
+    if (isTimeoutError(error)) {
+      throw new SoftRestartError(
+        `Transfer CC timeout for ${sendRequest.label}. Triggering immediate account restart.`,
+        1
+      );
+    }
+
+    throw error;
   }
 
   const transferData = isObject(transferResponse && transferResponse.data) ? transferResponse.data : {};
@@ -2700,33 +3498,70 @@ async function executeCcSendFlowWithCheckpointRecovery(
   onCheckpointRefresh,
   accountLogTag = null
 ) {
-  try {
-    return await executeCcSendFlow(client, sendRequest, accountLogTag);
-  } catch (error) {
-    if (!isVercelCheckpointError(error)) {
+  const MAX_CHECKPOINT_REFRESH_ATTEMPTS = 1;
+  const MAX_TRANSIENT_REFRESH_ATTEMPTS = 2;
+  let checkpointRefreshAttempt = 0;
+  let transientRefreshAttempt = 0;
+
+  while (true) {
+    try {
+      return await executeCcSendFlow(client, sendRequest, config, onCheckpointRefresh, accountLogTag);
+    } catch (error) {
+      if (error && error.isSoftRestart) {
+        throw error;
+      }
+
+      if (isVercelCheckpointError(error)) {
+        if (!config.session.autoRefreshCheckpoint) {
+          throw new Error(
+            "Send flow hit Vercel checkpoint and auto refresh is disabled (config.session.autoRefreshCheckpoint=false)."
+          );
+        }
+
+        if (checkpointRefreshAttempt >= MAX_CHECKPOINT_REFRESH_ATTEMPTS) {
+          throw error;
+        }
+
+        checkpointRefreshAttempt += 1;
+        console.log("[info] Send flow hit Vercel checkpoint, refreshing browser security cookies...");
+        const browserCookies = await solveBrowserChallenge(
+          config.baseUrl,
+          config.paths.onboard,
+          config.headers.userAgent,
+          true
+        );
+        client.mergeCookies(browserCookies);
+        if (typeof onCheckpointRefresh === "function") {
+          onCheckpointRefresh();
+        }
+        client.logCookieStatus("after browser refresh for send");
+        continue;
+      }
+
+      if (isTransientSendFlowError(error) && transientRefreshAttempt < MAX_TRANSIENT_REFRESH_ATTEMPTS) {
+        transientRefreshAttempt += 1;
+        await recoverSendFlowByRefresh(
+          client,
+          config,
+          onCheckpointRefresh,
+          accountLogTag,
+          transientRefreshAttempt,
+          MAX_TRANSIENT_REFRESH_ATTEMPTS,
+          {
+            mode: "light",
+            reason: "send-flow-transient",
+            runPreflight: false,
+            forceConnectionReset: transientRefreshAttempt >= MAX_TRANSIENT_REFRESH_ATTEMPTS
+          }
+        );
+        console.log(
+          `[info] Retrying full send flow after transient recovery (${transientRefreshAttempt}/${MAX_TRANSIENT_REFRESH_ATTEMPTS})...`
+        );
+        continue;
+      }
+
       throw error;
     }
-
-    if (!config.session.autoRefreshCheckpoint) {
-      throw new Error(
-        "Send flow hit Vercel checkpoint and auto refresh is disabled (config.session.autoRefreshCheckpoint=false)."
-      );
-    }
-
-    console.log("[info] Send flow hit Vercel checkpoint, refreshing browser security cookies...");
-    const browserCookies = await solveBrowserChallenge(
-      config.baseUrl,
-      config.paths.onboard,
-      config.headers.userAgent,
-      true
-    );
-    client.mergeCookies(browserCookies);
-    if (typeof onCheckpointRefresh === "function") {
-      onCheckpointRefresh();
-    }
-    client.logCookieStatus("after browser refresh for send");
-
-    return await executeCcSendFlow(client, sendRequest, accountLogTag);
   }
 }
 
@@ -2858,7 +3693,8 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
       deferRequiredAmount: null,
       deferAvailableAmount: null,
       deferProgress: null,
-      deferSendLabel: null
+      deferSendLabel: null,
+      sentRecipientLabels: []
     };
   }
 
@@ -2881,20 +3717,40 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
   let completedTx = 0;
   let skippedTx = 0;
   let deferredState = null;
+  const sentRecipientLabels = [];
+  const MAX_SEND_FLOW_RETRY_ATTEMPTS = 4;
+  const BALANCE_GUARD_RETRY_DELAY_MS = 2000;
+  const BALANCE_GUARD_RETRY_TIMEOUT_MS = BALANCE_CHECK_TIMEOUT_MS + 5000;
+  const BALANCE_GUARD_MIN_BUFFER_CC = 0.001;
+  const recipientCandidateMode = sendRequests.every(
+    (entry) => isObject(entry) && entry.internalRecipientCandidate === true
+  );
+  const expectedTxCount = recipientCandidateMode ? 1 : sendRequests.length;
 
   dashboard.setState({
-    swapsTotal: `0/${sendRequests.length}`,
+    swapsTotal: `0/${expectedTxCount}`,
     swapsOk: "0",
     swapsFail: "0"
   });
 
   for (let index = 0; index < sendRequests.length; index += 1) {
+    if (recipientCandidateMode && completedTx > 0) {
+      break;
+    }
+
     const sendRequest = sendRequests[index];
     const progress = `${index + 1}/${sendRequests.length}`;
+    const progressForDashboard = `${Math.min(index + 1, expectedTxCount)}/${expectedTxCount}`;
 
     // Check balance before each TX (with timeout fallback)
     stepLog(`[step] Check balance before tx ${progress} (timeout=${BALANCE_CHECK_TIMEOUT_MS}ms)`);
-    const currentBalance = await getBalanceWithTimeout(client);
+    let currentBalance = await getBalanceWithTimeout(client);
+
+    if (currentBalance === null) {
+      stepLog(`[step] Balance guard retry before tx ${progress} (timeout=${BALANCE_GUARD_RETRY_TIMEOUT_MS}ms)`);
+      await sleep(BALANCE_GUARD_RETRY_DELAY_MS);
+      currentBalance = await getBalanceWithTimeout(client, BALANCE_GUARD_RETRY_TIMEOUT_MS);
+    }
     
     if (currentBalance !== null) {
       dashboard.setState({
@@ -2905,16 +3761,46 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
       
       // Check if balance is sufficient (use ccNumeric for comparison)
       const requiredAmount = Number(sendRequest.amount);
+      const requiredWithBuffer = requiredAmount + BALANCE_GUARD_MIN_BUFFER_CC;
       const availableAmount = currentBalance.ccNumeric;
 
-      if (!Number.isFinite(availableAmount) || availableAmount < requiredAmount) {
+      if (currentBalance.available === false) {
         const retryAfterSeconds = TX_RETRY_INITIAL_DELAY_SECONDS;
         console.log(
-          `[warn] Deferring tx ${progress} due insufficient balance: need ${requiredAmount} CC, have ${availableAmount} CC (retry in ${retryAfterSeconds}s)`
+          `[warn] Deferring tx ${progress} because balance is not available yet ` +
+          `(amount=${requiredAmount}, cc=${currentBalance.cc})`
         );
         dashboard.setState({
           phase: "cooldown",
-          swapsTotal: `${index + 1}/${sendRequests.length}`,
+          swapsTotal: progressForDashboard,
+          swapsOk: String(completedTx),
+          swapsFail: String(skippedTx),
+          transfer: `deferred (balance-not-available) (${progress})`,
+          cooldown: `${retryAfterSeconds}s`,
+          send: `Deferred ${sendRequest.amount} CC -> ${sendRequest.label} (balance unavailable)`
+        });
+
+        deferredState = {
+          reason: "balance-not-available",
+          retryAfterSeconds,
+          requiredAmount,
+          availableAmount,
+          progress,
+          sendLabel: `${sendRequest.amount} CC -> ${sendRequest.label}`
+        };
+        break;
+      }
+
+      if (!Number.isFinite(availableAmount) || availableAmount < requiredWithBuffer) {
+        const retryAfterSeconds = TX_RETRY_INITIAL_DELAY_SECONDS;
+        console.log(
+          `[warn] Deferring tx ${progress} due insufficient balance: ` +
+          `need ${requiredAmount} CC (+buffer ${BALANCE_GUARD_MIN_BUFFER_CC}), have ${availableAmount} CC ` +
+          `(retry in ${retryAfterSeconds}s)`
+        );
+        dashboard.setState({
+          phase: "cooldown",
+          swapsTotal: progressForDashboard,
           swapsOk: String(completedTx),
           swapsFail: String(skippedTx),
           transfer: `deferred (insufficient) (${progress})`,
@@ -2933,14 +3819,37 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
         break;
       }
     } else {
-      // Balance check failed/timeout - proceed with TX anyway
-      console.log(`[info] Balance check timeout/failed, proceeding with tx ${progress} anyway...`);
+      // Balance check is required to avoid useless transfer timeouts when funds are not ready.
+      const retryAfterSeconds = TX_RETRY_INITIAL_DELAY_SECONDS;
+      console.log(
+        `[warn] Deferring tx ${progress} because balance check is unavailable after retry ` +
+        `(retry in ${retryAfterSeconds}s)`
+      );
+      dashboard.setState({
+        phase: "cooldown",
+        swapsTotal: progressForDashboard,
+        swapsOk: String(completedTx),
+        swapsFail: String(skippedTx),
+        transfer: `deferred (balance-check-unavailable) (${progress})`,
+        cooldown: `${retryAfterSeconds}s`,
+        send: `Deferred ${sendRequest.amount} CC -> ${sendRequest.label} (balance check unavailable)`
+      });
+
+      deferredState = {
+        reason: "balance-check-unavailable",
+        retryAfterSeconds,
+        requiredAmount: Number(sendRequest.amount),
+        availableAmount: null,
+        progress,
+        sendLabel: `${sendRequest.amount} CC -> ${sendRequest.label}`
+      };
+      break;
     }
 
     dashboard.setState({
       phase: "send",
       send: `${sendRequest.amount} CC -> ${sendRequest.label} (${progress})`,
-      swapsTotal: `${index + 1}/${sendRequests.length}`,
+      swapsTotal: progressForDashboard,
       swapsOk: String(completedTx),
       swapsFail: String(skippedTx)
     });
@@ -2949,6 +3858,11 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
 
     let sendResult = null;
     let retryAttempt = 0;
+    let skipToNextCandidate = false;
+    let hardReloginAttempt = 0;
+    const MAX_HARD_RELOGIN_ATTEMPTS = 1;
+    let fragmentedAmountReductionCount = 0;
+    const MAX_FRAGMENTED_BALANCE_REDUCTIONS = 4;
     while (sendResult === null && deferredState === null) {
       try {
         sendResult = await executeCcSendFlowWithCheckpointRecovery(
@@ -2959,21 +3873,105 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
           accountLogTag
         );
       } catch (error) {
+        if (error && error.isSoftRestart) {
+          throw error;
+        }
+
+        if (isBalanceContractFragmentationError(error)) {
+          const errorMessage = String(error && error.message ? error.message : error);
+
+          if (fragmentedAmountReductionCount < MAX_FRAGMENTED_BALANCE_REDUCTIONS) {
+            const nextAmount = getReducedAmountForFragmentedBalance(sendRequest.amount, config.send);
+            if (nextAmount && Number(nextAmount) < Number(sendRequest.amount)) {
+              const previousAmount = sendRequest.amount;
+              fragmentedAmountReductionCount += 1;
+              sendRequest.amount = nextAmount;
+
+              if (recipientCandidateMode) {
+                for (let candidateIndex = index + 1; candidateIndex < sendRequests.length; candidateIndex += 1) {
+                  sendRequests[candidateIndex].amount = nextAmount;
+                }
+              }
+
+              console.warn(
+                `[warn] TX ${progress} fragmented balance contracts. ` +
+                `Reducing amount ${previousAmount} -> ${nextAmount} ` +
+                `(step ${fragmentedAmountReductionCount}/${MAX_FRAGMENTED_BALANCE_REDUCTIONS}) and retrying now. ` +
+                `Detail: ${errorMessage}`
+              );
+
+              dashboard.setState({
+                phase: "cooldown",
+                transfer: `reduce-amount (${progress})`,
+                send: `Fragmented balance: ${previousAmount} -> ${nextAmount}`,
+                cooldown: "0s",
+                swapsTotal: progressForDashboard,
+                swapsOk: String(completedTx),
+                swapsFail: String(skippedTx)
+              });
+              continue;
+            }
+          }
+
+          const retryAfterSeconds = 180;
+          console.warn(
+            `[warn] TX ${progress} fragmented balance still blocking after reductions. ` +
+            `Deferring ${retryAfterSeconds}s. Last error: ${errorMessage}`
+          );
+          dashboard.setState({
+            phase: "cooldown",
+            transfer: `deferred (fragmented-balance) (${progress})`,
+            send: `Deferred ${sendRequest.amount} CC -> ${sendRequest.label} for ${retryAfterSeconds}s`,
+            cooldown: `${retryAfterSeconds}s`,
+            swapsTotal: progressForDashboard,
+            swapsOk: String(completedTx),
+            swapsFail: String(skippedTx)
+          });
+          deferredState = {
+            reason: "fragmented-balance",
+            retryAfterSeconds,
+            requiredAmount: Number(sendRequest.amount),
+            availableAmount: null,
+            progress,
+            sendLabel: `${sendRequest.amount} CC -> ${sendRequest.label}`
+          };
+          break;
+        }
+
         if (isSendEligibilityDelayError(error)) {
-          // SEND COOLDOWN: use minimum 7 minutes (420s) delay before any backoff
-          const SEND_COOLDOWN_MIN_DELAY_SECONDS = 420; // 7 minutes
+          // Server send cooldown floor is 10 minutes for reciprocal/internal safety.
+          const SEND_COOLDOWN_MIN_DELAY_SECONDS = 600; // 10 minutes
           const serverRetryAfter = parseRetryAfterSeconds(error, SEND_COOLDOWN_MIN_DELAY_SECONDS);
           const retryAfterSeconds = Math.max(serverRetryAfter, SEND_COOLDOWN_MIN_DELAY_SECONDS);
           const errorMessage = String(error && error.message ? error.message : error);
+
+          if (recipientCandidateMode && index < sendRequests.length - 1) {
+            console.warn(
+              `[warn] Recipient candidate ${sendRequest.label} blocked (${retryAfterSeconds}s). ` +
+              `Trying next candidate...`
+            );
+            dashboard.setState({
+              phase: "cooldown",
+              transfer: `candidate-blocked (${progress})`,
+              send: `Candidate blocked, trying next recipient...`,
+              cooldown: `${retryAfterSeconds}s`,
+              swapsTotal: progressForDashboard,
+              swapsOk: String(completedTx),
+              swapsFail: String(skippedTx)
+            });
+            skipToNextCandidate = true;
+            break;
+          }
+
           console.warn(
-            `[warn] Deferring tx ${progress} due server send rule. Retry in ${retryAfterSeconds}s (min 7min): ${errorMessage}`
+            `[warn] Deferring tx ${progress} due server send rule. Retry in ${retryAfterSeconds}s (min 10min): ${errorMessage}`
           );
           dashboard.setState({
             phase: "cooldown",
             transfer: `deferred (server-cooldown) (${progress})`,
             send: `Deferred ${sendRequest.amount} CC -> ${sendRequest.label} for ${retryAfterSeconds}s`,
             cooldown: `${retryAfterSeconds}s`,
-            swapsTotal: `${index + 1}/${sendRequests.length}`,
+            swapsTotal: progressForDashboard,
             swapsOk: String(completedTx),
             swapsFail: String(skippedTx)
           });
@@ -2989,9 +3987,90 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
         }
 
         retryAttempt += 1;
-        const retryDelaySeconds =
-          TX_RETRY_INITIAL_DELAY_SECONDS + ((retryAttempt - 1) * TX_RETRY_DELAY_STEP_SECONDS);
+        const transientSendError = isTransientSendFlowError(error);
+        const retryDelaySeconds = transientSendError
+          ? Math.min(30, 6 + ((retryAttempt - 1) * 8))
+          : TX_RETRY_INITIAL_DELAY_SECONDS + ((retryAttempt - 1) * TX_RETRY_DELAY_STEP_SECONDS);
         const errorMessage = String(error && error.message ? error.message : error);
+
+        if (retryAttempt >= MAX_SEND_FLOW_RETRY_ATTEMPTS) {
+          if (transientSendError && hardReloginAttempt < MAX_HARD_RELOGIN_ATTEMPTS) {
+            hardReloginAttempt += 1;
+            console.warn(
+              `[warn] TX ${progress} transient send errors persist. ` +
+              `Performing hard relogin recovery ${hardReloginAttempt}/${MAX_HARD_RELOGIN_ATTEMPTS}...`
+            );
+            dashboard.setState({
+              phase: "session-reuse",
+              transfer: `hard-relogin (${progress})`,
+              send: `Hard relogin ${sendRequest.amount} CC -> ${sendRequest.label}`,
+              cooldown: "0s",
+              swapsTotal: progressForDashboard,
+              swapsOk: String(completedTx),
+              swapsFail: String(skippedTx)
+            });
+
+            try {
+              await recoverSendFlowByRefresh(
+                client,
+                config,
+                onCheckpointRefresh,
+                accountLogTag,
+                hardReloginAttempt,
+                MAX_HARD_RELOGIN_ATTEMPTS,
+                {
+                  mode: "full-browser",
+                  reason: "send-hard-relogin",
+                  runPreflight: true,
+                  forceConnectionReset: true
+                }
+              );
+
+              await apiCallWithRetry(
+                () => client.syncAccount(config.paths.bridge),
+                "Sync account after hard relogin",
+                2,
+                20000,
+                { maxConsecutiveTimeouts: 2 }
+              );
+
+              retryAttempt = 0;
+              console.log(`[info] Hard relogin recovery completed. Retrying tx ${progress}...`);
+              continue;
+            } catch (reloginError) {
+              const reloginMessage = String(
+                reloginError && reloginError.message ? reloginError.message : reloginError
+              );
+              console.warn(
+                `[warn] Hard relogin recovery failed for tx ${progress}: ${reloginMessage}`
+              );
+            }
+          }
+
+          const retryAfterSeconds = transientSendError ? 60 : retryDelaySeconds;
+          console.warn(
+            `[warn] TX ${progress} reached retry limit (${MAX_SEND_FLOW_RETRY_ATTEMPTS}). ` +
+            `Deferring ${retryAfterSeconds}s. Last error: ${errorMessage}`
+          );
+          dashboard.setState({
+            phase: "cooldown",
+            transfer: `deferred (retry-limit) (${progress})`,
+            send: `Deferred ${sendRequest.amount} CC -> ${sendRequest.label} for ${retryAfterSeconds}s`,
+            cooldown: `${retryAfterSeconds}s`,
+            swapsTotal: progressForDashboard,
+            swapsOk: String(completedTx),
+            swapsFail: String(skippedTx)
+          });
+          deferredState = {
+            reason: transientSendError ? "send-flow-transient" : "send-flow-retry-limit",
+            retryAfterSeconds,
+            requiredAmount: Number(sendRequest.amount),
+            availableAmount: null,
+            progress,
+            sendLabel: `${sendRequest.amount} CC -> ${sendRequest.label}`
+          };
+          break;
+        }
 
         console.warn(
           `[warn] TX ${progress} failed (attempt ${retryAttempt}) and will retry in ${retryDelaySeconds}s: ${errorMessage}`
@@ -3002,7 +4081,7 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
           transfer: `retry-${retryAttempt} (${progress})`,
           send: `Retrying ${sendRequest.amount} CC -> ${sendRequest.label} in ${retryDelaySeconds}s`,
           cooldown: `${retryDelaySeconds}s`,
-          swapsTotal: `${index + 1}/${sendRequests.length}`,
+          swapsTotal: progressForDashboard,
           swapsOk: String(completedTx),
           swapsFail: String(skippedTx)
         });
@@ -3011,14 +4090,30 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
       }
     }
 
+    if (skipToNextCandidate) {
+      continue;
+    }
+
     if (deferredState) {
       break;
     }
 
+    if (!sendResult) {
+      skippedTx += 1;
+      continue;
+    }
+
     completedTx++;
+    if (sendRequest.label) {
+      sentRecipientLabels.push(String(sendRequest.label));
+    }
 
     // Record send pair for internal transfers to avoid reciprocal cooldowns
-    if (sendRequest.source === "internal-round-robin" && senderAccountName && sendRequest.label) {
+    if (
+      String(sendRequest.source || "").startsWith("internal-") &&
+      senderAccountName &&
+      sendRequest.label
+    ) {
       recordSendPair(senderAccountName, sendRequest.label);
     }
 
@@ -3026,10 +4121,17 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
       phase: "send",
       send: `${sendRequest.amount} CC -> ${sendRequest.label} (${progress})`,
       transfer: `${sendResult.status} | id=${sendResult.transferId || "n/a"} (${progress})`,
-      swapsTotal: `${index + 1}/${sendRequests.length}`,
+      swapsTotal: `${completedTx}/${expectedTxCount}`,
       swapsOk: String(completedTx),
       swapsFail: String(skippedTx)
     });
+
+    if (recipientCandidateMode && completedTx >= expectedTxCount) {
+      console.log(
+        `[info] Internal recipient selected via candidate ${index + 1}/${sendRequests.length}: ${sendRequest.label}`
+      );
+      break;
+    }
 
     // Delay between transactions (skip after last tx)
     if (index < sendRequests.length - 1 && delayTxMaxSec > 0) {
@@ -3057,7 +4159,8 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
       deferRequiredAmount: deferredState.requiredAmount,
       deferAvailableAmount: deferredState.availableAmount,
       deferProgress: deferredState.progress,
-      deferSendLabel: deferredState.sendLabel
+      deferSendLabel: deferredState.sendLabel,
+      sentRecipientLabels
     };
   }
 
@@ -3067,7 +4170,7 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
   if (postSendBalance !== null) {
     dashboard.setState({
       balance: `CC=${postSendBalance.cc} | USDCx=${postSendBalance.usdcx} | CBTC=${postSendBalance.cbtc}`,
-      swapsTotal: `${completedTx + skippedTx}/${sendRequests.length}`,
+      swapsTotal: `${Math.min(expectedTxCount, completedTx + skippedTx)}/${expectedTxCount}`,
       swapsOk: String(completedTx),
       swapsFail: String(skippedTx),
       cooldown: "-"
@@ -3076,14 +4179,16 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
   } else {
     console.log(`[warn] Final balance check timeout/failed`);
     dashboard.setState({
-      swapsTotal: `${completedTx + skippedTx}/${sendRequests.length}`,
+      swapsTotal: `${Math.min(expectedTxCount, completedTx + skippedTx)}/${expectedTxCount}`,
       swapsOk: String(completedTx),
       swapsFail: String(skippedTx),
       cooldown: "-"
     });
   }
 
-  console.log(`[info] Batch summary: completed=${completedTx}, skipped=${skippedTx}, total=${sendRequests.length}`);
+  console.log(
+    `[info] Batch summary: completed=${completedTx}, skipped=${skippedTx}, total=${expectedTxCount}`
+  );
   return {
     completedTx,
     skippedTx,
@@ -3093,12 +4198,36 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
     deferRequiredAmount: null,
     deferAvailableAmount: null,
     deferProgress: null,
-    deferSendLabel: null
+    deferSendLabel: null,
+    sentRecipientLabels
   };
 }
 
 async function refreshVercelSecurityCookies(client, config, reasonLabel, onCheckpointRefresh) {
   console.log(`[info] ${reasonLabel}`);
+  const hadSecurityCookie = client.hasSecurityCookie();
+  const hadSessionCookie = client.hasAccountSessionCookie();
+  const retryAfterSeconds = Math.max(
+    60,
+    clampToNonNegativeInt(config.session.browserChallengeRetryAfterSeconds, 120)
+  );
+  const cooldownRemainingSeconds = getBrowserChallengeCooldownRemainingSeconds();
+
+  if (cooldownRemainingSeconds > 0 && (hadSecurityCookie || hadSessionCookie)) {
+    console.log(
+      `[warn] Browser challenge cooldown active (${cooldownRemainingSeconds}s). ` +
+        "Skipping Puppeteer refresh and deferring."
+    );
+    return {
+      refreshed: false,
+      unavailable: true,
+      retryAfterSeconds: Math.max(retryAfterSeconds, cooldownRemainingSeconds),
+      reason: "browser-rate-limit-cooldown"
+    };
+  }
+
+  cacheSecurityCookiesFromMap(client.cookieJar, "client-before-refresh");
+
   const browserCookies = await solveBrowserChallenge(
     config.baseUrl,
     config.paths.onboard,
@@ -3107,13 +4236,55 @@ async function refreshVercelSecurityCookies(client, config, reasonLabel, onCheck
   );
 
   if (!browserCookies || browserCookies.size === 0) {
-    throw new Error("Browser challenge did not return any cookies.");
+    markBrowserChallengeRateLimited(retryAfterSeconds);
+    const cachedSecurityMap = buildCachedSecurityCookieMap();
+
+    if (cachedSecurityMap.size > 0) {
+      console.log(
+        `[warn] Browser challenge returned no cookies. ` +
+          `Applying ${cachedSecurityMap.size} cached security cookie(s) fallback.`
+      );
+
+      client.mergeCookies(cachedSecurityMap);
+      try {
+        await client.preflightOnboard();
+        client.logCookieStatus("after cached security cookie fallback");
+        return {
+          refreshed: false,
+          unavailable: false,
+          retryAfterSeconds: 0,
+          reason: "cached-security-cookie-fallback"
+        };
+      } catch (cacheError) {
+        console.log(`[warn] Cached security cookie fallback failed: ${cacheError.message}`);
+      }
+    }
+
+    if (hadSecurityCookie || hadSessionCookie) {
+      console.log(
+        "[warn] Browser challenge returned no cookies (likely rate-limited/429). " +
+          "Keeping existing cookies and deferring refresh."
+      );
+      return {
+        refreshed: false,
+        unavailable: true,
+        retryAfterSeconds,
+        reason: "browser-no-cookies"
+      };
+    }
+
+    const error = new Error("Browser challenge did not return any cookies.");
+    error.code = "BROWSER_CHALLENGE_NO_COOKIES";
+    error.retryAfterSeconds = retryAfterSeconds;
+    throw error;
   }
 
+  cacheSecurityCookiesFromMap(browserCookies, "refresh-browser-challenge");
   client.mergeCookies(browserCookies);
   if (typeof onCheckpointRefresh === "function") {
     onCheckpointRefresh();
   }
+  browserChallengeRateLimitedUntilMs = 0;
 
   // Validate refreshed cookie against the same fetch path used by API client.
   try {
@@ -3122,33 +4293,86 @@ async function refreshVercelSecurityCookies(client, config, reasonLabel, onCheck
   } catch (error) {
     console.log(`[warn] Refresh preflight still blocked: ${error.message}`);
   }
+
+  return {
+    refreshed: true,
+    unavailable: false,
+    retryAfterSeconds: 0,
+    reason: "ok"
+  };
 }
 
-async function attemptSessionReuse(client, config, onCheckpointRefresh) {
+async function attemptSessionReuse(client, config, onCheckpointRefresh, accountLogTag = null) {
+  const logSession = (message) => console.log(withAccountTag(accountLogTag, message));
+
   const maxCheckpointRefreshAttempts = Math.max(
     1,
     clampToNonNegativeInt(config.session.maxSessionReuseRefreshAttempts, 3)
+  );
+  const maxTransientAttempts = Math.max(
+    1,
+    clampToNonNegativeInt(config.session.maxSessionReuseTransientAttempts, 6)
+  );
+  const maxTransientLightResets = Math.max(
+    0,
+    clampToNonNegativeInt(config.session.maxSessionReuseLightResets, 1)
+  );
+  const maxTransientBrowserRefreshes = Math.max(
+    0,
+    clampToNonNegativeInt(config.session.maxSessionReuseTransientBrowserRefreshes, 0)
+  );
+  const transientRetryAfterSeconds = Math.max(
+    15,
+    clampToNonNegativeInt(config.session.sessionReuseTransientRetryAfterSeconds, 45)
+  );
+  const retryJitterSeconds = Math.max(
+    0,
+    clampToNonNegativeInt(config.session.sessionReuseRetryJitterSeconds, 12)
   );
   const settleDelayMs = Math.max(
     0,
     clampToNonNegativeInt(config.session.checkpointSettleDelayMs, 3500)
   );
+  const browserChallengeRetryAfterSeconds = Math.max(
+    60,
+    clampToNonNegativeInt(config.session.browserChallengeRetryAfterSeconds, 120)
+  );
+  const buildTransientDeferral = (message) => {
+    const transientLimitError = new Error(message);
+    transientLimitError.code = "SESSION_REUSE_TRANSIENT_RETRY_LIMIT";
+    transientLimitError.retryAfterSeconds = browserChallengeRetryAfterSeconds;
+    return {
+      ok: false,
+      error: transientLimitError,
+      retryAfterSeconds: browserChallengeRetryAfterSeconds
+    };
+  };
+
+  applySessionReuseConcurrencyLimit(config.session.maxConcurrentSessionReuse);
 
   let lastError = null;
   let attempt = 0;
   let checkpointRefreshAttempt = 0;
+  let transientFailureCount = 0;
+  let transientLightResetCount = 0;
+  let transientBrowserRefreshCount = 0;
 
   while (true) {
     attempt += 1;
     try {
       // Step 1: Sync account (this validates session)
-      console.log(`[info] Session reuse attempt ${attempt}: calling sync-account...`);
+      await acquireSessionReuseSlot(accountLogTag);
       const syncStart = Date.now();
-      await client.syncAccount(config.paths.bridge);
-      console.log(`[info] Session reuse attempt ${attempt}: sync-account OK (${Date.now() - syncStart}ms)`);
+      try {
+        logSession(`[info] Session reuse attempt ${attempt}: calling sync-account...`);
+        await client.syncAccount(config.paths.bridge);
+        logSession(`[info] Session reuse attempt ${attempt}: sync-account OK (${Date.now() - syncStart}ms)`);
+      } finally {
+        releaseSessionReuseSlot(accountLogTag);
+      }
       
       // Step 2: Balance check (optional, timeout OK - session is still valid)
-      console.log(`[info] Session reuse attempt ${attempt}: calling balances (timeout=15s)...`);
+      logSession(`[info] Session reuse attempt ${attempt}: calling balances (timeout=15s)...`);
       const balanceStart = Date.now();
       
       let balancesData = {};
@@ -3160,11 +4384,11 @@ async function attemptSessionReuse(client, config, onCheckpointRefresh) {
         
         const balancesResponse = await Promise.race([balancePromise, timeoutPromise]);
         balancesData = balancesResponse && balancesResponse.data ? balancesResponse.data : {};
-        console.log(`[info] Session reuse attempt ${attempt}: balances OK (${Date.now() - balanceStart}ms)`);
+        logSession(`[info] Session reuse attempt ${attempt}: balances OK (${Date.now() - balanceStart}ms)`);
       } catch (balanceError) {
         // Balance timeout is OK - session is still valid (sync-account passed)
-        console.log(`[warn] Balance check failed: ${balanceError.message}`);
-        console.log(`[info] Session is still valid (sync-account passed), continuing without balance data...`);
+        logSession(`[warn] Balance check failed: ${balanceError.message}`);
+        logSession(`[info] Session is still valid (sync-account passed), continuing without balance data...`);
       }
       
       return {
@@ -3172,14 +4396,91 @@ async function attemptSessionReuse(client, config, onCheckpointRefresh) {
         balancesData
       };
     } catch (error) {
-      console.log(`[info] Session reuse attempt ${attempt} failed: ${error.message}`);
+      logSession(`[info] Session reuse attempt ${attempt} failed: ${error.message}`);
       lastError = error;
 
       if (isSessionReuseTimeoutError(error)) {
-        console.log(
-          `[info] Session reuse timeout detected. Retrying in ${SESSION_REUSE_TIMEOUT_BACKOFF_SECONDS}s...`
+        transientFailureCount += 1;
+
+        if (transientLightResetCount < maxTransientLightResets) {
+          transientLightResetCount += 1;
+          logSession(
+            `[info] Session reuse transient recovery (light reset ${transientLightResetCount}/${maxTransientLightResets})`
+          );
+          await resetConnectionPool();
+        } else if (
+          config.session.autoRefreshCheckpoint &&
+          transientBrowserRefreshCount < maxTransientBrowserRefreshes
+        ) {
+          transientBrowserRefreshCount += 1;
+          let refreshResult = null;
+          try {
+            refreshResult = await refreshVercelSecurityCookies(
+              client,
+              config,
+              `Session reuse transient failures persist (browser refresh ${transientBrowserRefreshCount}/${maxTransientBrowserRefreshes})`,
+              onCheckpointRefresh
+            );
+          } catch (refreshError) {
+            if (refreshError && refreshError.code === "BROWSER_CHALLENGE_NO_COOKIES") {
+              logSession(
+                `[warn] Browser challenge unavailable during transient recovery. ` +
+                `Deferring session reuse ${browserChallengeRetryAfterSeconds}s.`
+              );
+              return buildTransientDeferral(
+                "Session reuse deferred: browser challenge unavailable (no cookies)."
+              );
+            }
+            throw refreshError;
+          }
+
+          if (refreshResult && refreshResult.unavailable) {
+            logSession(
+              `[warn] Browser challenge temporarily unavailable. ` +
+                `Deferring session reuse ${browserChallengeRetryAfterSeconds}s.`
+            );
+            return buildTransientDeferral(
+              "Session reuse deferred: browser challenge temporarily unavailable."
+            );
+          }
+
+          client.logCookieStatus(`after session transient browser refresh ${transientBrowserRefreshCount}`);
+          if (settleDelayMs > 0) {
+            logSession(`[info] Waiting ${settleDelayMs}ms for token settle before session reuse retry...`);
+            await sleep(settleDelayMs);
+          }
+        }
+
+        if (transientFailureCount >= maxTransientAttempts) {
+          const transientLimitError = new Error(
+            `Session reuse transient retry limit reached (${maxTransientAttempts}) after repeated network failures.`
+          );
+          transientLimitError.code = "SESSION_REUSE_TRANSIENT_RETRY_LIMIT";
+          transientLimitError.retryAfterSeconds = transientRetryAfterSeconds;
+          return {
+            ok: false,
+            error: transientLimitError,
+            retryAfterSeconds: transientRetryAfterSeconds
+          };
+        }
+
+        const retryBaseSeconds = Math.min(20, transientRetryAfterSeconds);
+        const retryStepSeconds = Math.min(12, (transientFailureCount - 1) * 3);
+        const retryJitterAddSeconds = retryJitterSeconds > 0
+          ? randomIntInclusive(0, retryJitterSeconds)
+          : 0;
+        const retryDelaySeconds = Math.max(
+          5,
+          Math.min(
+            transientRetryAfterSeconds + retryJitterSeconds,
+            retryBaseSeconds + retryStepSeconds + retryJitterAddSeconds
+          )
         );
-        await sleep(SESSION_REUSE_TIMEOUT_BACKOFF_SECONDS * 1000);
+        logSession(
+          `[info] Session reuse timeout detected. Retrying in ${retryDelaySeconds}s... ` +
+          `(transient ${transientFailureCount}/${maxTransientAttempts})`
+        );
+        await sleep(retryDelaySeconds * 1000);
         continue;
       }
 
@@ -3189,15 +4490,40 @@ async function attemptSessionReuse(client, config, onCheckpointRefresh) {
         checkpointRefreshAttempt < maxCheckpointRefreshAttempts
       ) {
         checkpointRefreshAttempt += 1;
-        await refreshVercelSecurityCookies(
-          client,
-          config,
-          `Session reuse blocked by Vercel checkpoint (refresh ${checkpointRefreshAttempt}/${maxCheckpointRefreshAttempts}), refreshing browser security cookies...`,
-          onCheckpointRefresh
-        );
+        let refreshResult = null;
+        try {
+          refreshResult = await refreshVercelSecurityCookies(
+            client,
+            config,
+            `Session reuse blocked by Vercel checkpoint (refresh ${checkpointRefreshAttempt}/${maxCheckpointRefreshAttempts}), refreshing browser security cookies...`,
+            onCheckpointRefresh
+          );
+        } catch (refreshError) {
+          if (refreshError && refreshError.code === "BROWSER_CHALLENGE_NO_COOKIES") {
+            logSession(
+              `[warn] Browser challenge unavailable during checkpoint recovery. ` +
+                `Deferring session reuse ${browserChallengeRetryAfterSeconds}s.`
+            );
+            return buildTransientDeferral(
+              "Session reuse deferred: browser challenge unavailable (checkpoint recovery)."
+            );
+          }
+          throw refreshError;
+        }
+
+        if (refreshResult && refreshResult.unavailable) {
+          logSession(
+            `[warn] Browser challenge temporarily unavailable during checkpoint recovery. ` +
+              `Deferring session reuse ${browserChallengeRetryAfterSeconds}s.`
+          );
+          return buildTransientDeferral(
+            "Session reuse deferred: browser challenge temporarily unavailable (checkpoint recovery)."
+          );
+        }
+
         client.logCookieStatus(`after session refresh attempt ${checkpointRefreshAttempt}`);
         if (settleDelayMs > 0) {
-          console.log(`[info] Waiting ${settleDelayMs}ms for Vercel token settle before retry...`);
+          logSession(`[info] Waiting ${settleDelayMs}ms for Vercel token settle before retry...`);
           await sleep(settleDelayMs);
         }
         continue;
@@ -3268,8 +4594,16 @@ async function processAccount(context) {
     accountSnapshots,
     loopRound,
     totalLoopRounds,
-    maxLoopTxOverride
+    maxLoopTxOverride,
+    smartFillBlockRecipients,
+    resumeFromDeferReason
   } = context;
+  const safeSmartFillBlockRecipients = Array.isArray(smartFillBlockRecipients)
+    ? smartFillBlockRecipients
+        .map((item) => String(item || "").trim())
+        .filter((item) => Boolean(item))
+    : [];
+  const safeResumeFromDeferReason = String(resumeFromDeferReason || "").trim();
 
   const selectedEmail = String(process.env.ROOTSFI_EMAIL || account.email).trim();
   if (!selectedEmail || !selectedEmail.includes("@")) {
@@ -3296,6 +4630,18 @@ async function processAccount(context) {
     })
     .join(" | ");
   const accountConfig = cloneRuntimeConfig(config);
+
+  if (safeResumeFromDeferReason) {
+    accountConfig.session.maxSessionReuseTransientAttempts = 1;
+    accountConfig.session.maxSessionReuseLightResets = 0;
+    accountConfig.session.maxSessionReuseTransientBrowserRefreshes = 0;
+    accountConfig.session.sessionReuseTransientRetryAfterSeconds = 20;
+    console.log(
+      `[session] Fast retry mode for deferred account (${safeResumeFromDeferReason}): ` +
+      `transient=${accountConfig.session.maxSessionReuseTransientAttempts} ` +
+      `lightResets=${accountConfig.session.maxSessionReuseLightResets}`
+    );
+  }
   const configuredMaxLoopTx = clampToNonNegativeInt(
     accountConfig.send.maxLoopTx || accountConfig.send.maxTx,
     1
@@ -3408,52 +4754,75 @@ async function processAccount(context) {
       });
       console.log(`[init] Send plan: ${amountLabel} CC x${sendRequests.length} -> [${recipientsList}]`);
     } else if (sendMode === "internal") {
-      // Internal mode - one-directional ring strategy (parallel execution)
-      // Each account sends to next account in sorted ring: A->B, B->C, C->A
       if (!sendPolicy.randomAmount.enabled) {
         throw new Error("Internal mode requires config.send.randomAmount.enabled=true");
       }
 
-      // Build single request using ring strategy (one TX per account per round)
-      const singleRequest = buildInternalSendRequest(
+      const internalPlan = buildInternalSendRequests(
         selectedAccounts,
         account.name,
-        sendPolicy
+        sendPolicy,
+        currentRound,
+        safeSmartFillBlockRecipients
       );
 
-      const amountLabel = `${sendPolicy.randomAmount.min}-${sendPolicy.randomAmount.max} (random)`;
-      
-      if (!singleRequest) {
-        // Should not happen with valid config, but handle gracefully
-        console.log(`[ring] ${account.name}: No recipient available (config issue?)`);
+      if (safeSmartFillBlockRecipients.length > 0) {
+        console.log(
+          `[internal] Smart-fill guard for ${account.name}: avoid send-back to [${safeSmartFillBlockRecipients.join(", ")}]`
+        );
+      }
+
+      if (!internalPlan || internalPlan.requests.length === 0) {
+        const retryAfterSeconds = Math.max(
+          TX_RETRY_INITIAL_DELAY_SECONDS,
+          clampToNonNegativeInt(
+            internalPlan && internalPlan.retryAfterSeconds,
+            TX_RETRY_INITIAL_DELAY_SECONDS
+          )
+        );
+        const deferReason =
+          internalPlan && internalPlan.reason
+            ? internalPlan.reason
+            : "internal-recipient-unavailable";
+
+        console.log(
+          `[internal] ${account.name}: defer send (${deferReason}) for ${retryAfterSeconds}s`
+        );
         dashboard.setState({
-          send: `No recipient available`,
-          mode: "internal",
-          phase: "skip"
+          phase: "cooldown",
+          send: `Deferred internal send for ${retryAfterSeconds}s`,
+          transfer: "deferred (internal-recipient)",
+          cooldown: `${retryAfterSeconds}s`,
+          mode: "internal-rotating"
         });
-        
+
         return {
           success: true,
           account: account.name,
-          mode: "internal-skip",
-          deferred: false,
-          deferReason: null,
-          deferRetryAfterSeconds: 0,
+          mode: "internal-rotating-deferred",
+          deferred: true,
+          deferReason,
+          deferRetryAfterSeconds: retryAfterSeconds,
           deferRequiredAmount: null,
           deferAvailableAmount: null,
           txCompleted: 0,
-          txSkipped: 1
+          txSkipped: 0
         };
       }
-      
-      // Wrap single request in array for executeSendBatch compatibility
-      sendRequests = [singleRequest];
-      
+
+      sendRequests = internalPlan.requests;
+      const primaryRequest = sendRequests[0];
+      const fallbackCount = Math.max(0, sendRequests.length - 1);
+      const fallbackLabel = fallbackCount > 0 ? ` (+${fallbackCount} fallback)` : "";
+
       dashboard.setState({
-        send: `${singleRequest.amount} CC -> ${singleRequest.label}`,
-        mode: "internal-ring"
+        send: `${primaryRequest.amount} CC -> ${primaryRequest.label}${fallbackLabel}`,
+        mode: "internal-rotating"
       });
-      console.log(`[init] Send plan (ring): ${singleRequest.amount} CC -> ${singleRequest.label}`);
+      console.log(
+        `[init] Send plan (internal-rotating): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
+          `${fallbackLabel} | offset=${internalPlan.primaryOffset}`
+      );
     } else {
       dashboard.setState({ mode: "balance-only" });
       console.log("[init] Balance check only mode");
@@ -3476,7 +4845,7 @@ async function processAccount(context) {
       };
     }
 
-    const client = new RootsFiApiClient(accountConfig);
+    let client = new RootsFiApiClient(accountConfig);
     updateCookieDashboard(client, "startup");
     client.logCookieStatus("startup");
 
@@ -3533,8 +4902,81 @@ async function processAccount(context) {
     if (client.hasAccountSessionCookie()) {
       dashboard.setState({ phase: "session-reuse" });
       console.log(withAccountTag(accountLogTag, "[step] Attempt existing session (skip OTP)"));
-      const sessionReuse = await attemptSessionReuse(client, accountConfig, markCheckpointRefresh);
+      let sessionReuse = await attemptSessionReuse(
+        client,
+        accountConfig,
+        markCheckpointRefresh,
+        accountLogTag
+      );
       updateCookieDashboard(client);
+
+      if (sessionReuse && !sessionReuse.ok && sessionReuse.error && sessionReuse.error.code === "SESSION_REUSE_TRANSIENT_RETRY_LIMIT") {
+        console.log(
+          withAccountTag(
+            accountLogTag,
+            "[info] Session transient limit reached. Trying one-time client hot-restart (rerun-like recovery)..."
+          )
+        );
+
+        await resetConnectionPool({ forceReset: true });
+
+        const hotRestartConfig = cloneRuntimeConfig(accountConfig);
+        const isDeferredResume = Boolean(safeResumeFromDeferReason);
+        hotRestartConfig.session.maxSessionReuseTransientAttempts = isDeferredResume
+          ? 2
+          : Math.max(
+              3,
+              Math.min(
+                6,
+                clampToNonNegativeInt(accountConfig.session.maxSessionReuseTransientAttempts, 6)
+              )
+            );
+        hotRestartConfig.session.maxSessionReuseLightResets = isDeferredResume
+          ? 0
+          : Math.max(
+              0,
+              Math.min(
+                1,
+                clampToNonNegativeInt(accountConfig.session.maxSessionReuseLightResets, 1)
+              )
+            );
+        hotRestartConfig.session.maxSessionReuseTransientBrowserRefreshes = Math.max(
+          0,
+          Math.min(
+            1,
+            clampToNonNegativeInt(accountConfig.session.maxSessionReuseTransientBrowserRefreshes, 0)
+          )
+        );
+        hotRestartConfig.session.sessionReuseTransientRetryAfterSeconds = isDeferredResume ? 20 : 45;
+
+        const hotRestartClient = new RootsFiApiClient(hotRestartConfig);
+        hotRestartClient.parseCookieString(client.getCookieHeader());
+        hotRestartClient.logCookieStatus("before session hot-restart attempt");
+
+        const hotRestartReuse = await attemptSessionReuse(
+          hotRestartClient,
+          hotRestartConfig,
+          markCheckpointRefresh,
+          accountLogTag
+        );
+
+        if (hotRestartReuse.ok) {
+          console.log(withAccountTag(accountLogTag, "[info] Session hot-restart succeeded."));
+          client = hotRestartClient;
+          sessionReuse = hotRestartReuse;
+          updateCookieDashboard(client, "session-hot-restart");
+        } else {
+          console.log(
+            withAccountTag(
+              accountLogTag,
+              `[warn] Session hot-restart did not recover: ${hotRestartReuse.error ? hotRestartReuse.error.message : "unknown"}`
+            )
+          );
+          client = hotRestartClient;
+          sessionReuse = hotRestartReuse;
+          updateCookieDashboard(client);
+        }
+      }
 
       if (sessionReuse.ok) {
         const balance = printBalanceSummary(sessionReuse.balancesData);
@@ -3601,12 +5043,60 @@ async function processAccount(context) {
           ),
           deferRequiredAmount: sendBatchResult.deferRequiredAmount,
           deferAvailableAmount: sendBatchResult.deferAvailableAmount,
+          sentRecipientLabels: Array.isArray(sendBatchResult.sentRecipientLabels)
+            ? sendBatchResult.sentRecipientLabels
+            : [],
           txCompleted: clampToNonNegativeInt(sendBatchResult.completedTx, 0),
           txSkipped: clampToNonNegativeInt(sendBatchResult.skippedTx, 0)
         };
       }
 
       const sessionError = sessionReuse.error;
+      if (sessionError && sessionError.code === "SESSION_REUSE_TRANSIENT_RETRY_LIMIT") {
+        const retryAfterSeconds = Math.max(
+          TX_RETRY_INITIAL_DELAY_SECONDS,
+          clampToNonNegativeInt(
+            sessionReuse.retryAfterSeconds,
+            clampToNonNegativeInt(sessionError.retryAfterSeconds, 90)
+          )
+        );
+
+        dashboard.setState({
+          phase: "cooldown",
+          transfer: "deferred (session-reuse-transient)",
+          send: `Session reuse unstable. Deferred ${retryAfterSeconds}s`,
+          cooldown: `${retryAfterSeconds}s`
+        });
+        console.log(
+          withAccountTag(
+            accountLogTag,
+            `[warn] Session reuse deferred after transient retry limit. Retry in ${retryAfterSeconds}s.`
+          )
+        );
+
+        tokens.accounts[account.name] = applyClientStateToTokenProfile(
+          accountToken,
+          client,
+          checkpointRefreshCount,
+          lastVercelRefreshAt
+        );
+        await saveTokensSerial(tokensPath, tokens);
+
+        return {
+          success: true,
+          account: account.name,
+          mode: "session-reuse-deferred",
+          deferred: true,
+          deferReason: "session-reuse-transient",
+          deferRetryAfterSeconds: retryAfterSeconds,
+          deferRequiredAmount: null,
+          deferAvailableAmount: null,
+          sentRecipientLabels: [],
+          txCompleted: 0,
+          txSkipped: 0
+        };
+      }
+
       if (isVercelCheckpointError(sessionError)) {
         tokens.accounts[account.name] = applyClientStateToTokenProfile(
           accountToken,
@@ -3794,6 +5284,9 @@ async function processAccount(context) {
       ),
       deferRequiredAmount: sendBatchResult.deferRequiredAmount,
       deferAvailableAmount: sendBatchResult.deferAvailableAmount,
+      sentRecipientLabels: Array.isArray(sendBatchResult.sentRecipientLabels)
+        ? sendBatchResult.sentRecipientLabels
+        : [],
       txCompleted: clampToNonNegativeInt(sendBatchResult.completedTx, 0),
       txSkipped: clampToNonNegativeInt(sendBatchResult.skippedTx, 0)
     };
@@ -3844,10 +5337,10 @@ async function runDailyCycle(context) {
   // Reset global TX stats untuk daily cycle baru
   resetGlobalTxStats();
   
-  // Clean up expired send pairs (legacy - not used in ring strategy)
+  // Clean up expired reciprocal cooldown state from previous runs
   cleanupExpiredSendPairs();
   
-  // Sort accounts for consistent ring order (NO SHUFFLE - predictable pattern)
+  // Sort accounts for deterministic base order used by rotating offset strategy
   const sortedAccounts = [...accounts.accounts].sort((a, b) => 
     a.name.localeCompare(b.name)
   );
@@ -3855,8 +5348,8 @@ async function runDailyCycle(context) {
   console.log(`\n${"#".repeat(70)}`);
   console.log(`[cycle] Loop cycle started at ${formatUTCTime(cycleStartTime)}`);
   console.log(`[cycle] Mode: ${sendMode} | Accounts: ${sortedAccounts.length}`);
-  console.log(`[ring] Strategy: ONE-DIRECTIONAL RING with PARALLEL EXECUTION`);
-  console.log(`[ring] Pattern: A->B, B->C, C->A (all accounts send simultaneously)`);
+  console.log(`[internal] Strategy: ADAPTIVE ROTATING OFFSETS + COOLDOWN-AWARE FALLBACK`);
+  console.log(`[internal] Guard: no direct send-back to previous sender for >=10 minutes`);
   console.log(`${"#".repeat(70)}\n`);
 
   const results = [];
@@ -3886,38 +5379,76 @@ async function runDailyCycle(context) {
     config.send.delayCycleSeconds,
     INTERNAL_API_DEFAULTS.send.delayCycleSeconds
   );
+  const forceSequentialAllRounds =
+    typeof config.send.sequentialAllRounds === "boolean"
+      ? config.send.sequentialAllRounds
+      : INTERNAL_API_DEFAULTS.send.sequentialAllRounds;
   
   const accountSnapshots = {};
   const roundDeferPollSeconds = TX_RETRY_INITIAL_DELAY_SECONDS;
+  const SMART_FILL_RETRY_DELAY_SECONDS = 20;
+  const SMART_FILL_MAX_ATTEMPTS_PER_ROUND = 2;
+  const CARRY_OVER_ROUND_DEFER_DEFAULT_SECONDS = 45;
+  const carryOverDeferStateByAccount = new Map();
 
-  // Display ring order (consistent, not shuffled)
+  // Display deterministic account order used as rotating baseline.
   const ringOrderLabel = sortedAccounts.map((item) => item.name).join(" -> ");
-  console.log(`[ring] Fixed ring order: ${ringOrderLabel}`);
+  console.log(`[internal] Base account order: ${ringOrderLabel}`);
   console.log(`[cycle] Loop rounds: ${totalLoopRounds} (maxLoopTx=${configuredMaxLoopTx})`);
-  console.log(`[cycle] Parallel jitter: ${parallelJitterMinSec}-${parallelJitterMaxSec}s per account`);
+  if (forceSequentialAllRounds) {
+    console.log("[cycle] Execution mode: sequential all rounds (parallel disabled)");
+  } else {
+    console.log(`[cycle] Parallel jitter: ${parallelJitterMinSec}-${parallelJitterMaxSec}s per account`);
+  }
   console.log(`[cycle] Round delay: ${delayRoundSec}s between rounds\n`);
 
   for (let roundIndex = 0; roundIndex < totalLoopRounds; roundIndex += 1) {
     const loopRound = roundIndex + 1;
     
-    // Round Robin: increment offset (legacy, but kept for consistency)
+    // Increment round offset seed used by internal rotating recipient planner.
     incrementRoundRobinOffset();
     
     const maxDeferPassesPerRound = Math.max(3, sortedAccounts.length * 4);
     
-    // Round 1 is SEQUENTIAL (to handle OTP/login prompts one by one)
-    // Round 2+ is PARALLEL (sessions already established)
-    const isSequentialRound = (loopRound === 1);
-    const executionMode = isSequentialRound ? "SEQUENTIAL (auth/OTP)" : "PARALLEL";
+    // Sequential mode can be forced for all rounds to reduce server pressure.
+    // If disabled, round 1 stays sequential and round 2+ runs in parallel.
+    const isSequentialRound = forceSequentialAllRounds || (loopRound === 1);
+    const executionMode = isSequentialRound
+      ? (forceSequentialAllRounds ? "SEQUENTIAL (all rounds)" : "SEQUENTIAL (auth/OTP)")
+      : "PARALLEL";
     
     console.log(`\n[cycle] Round ${loopRound}/${totalLoopRounds} started (${executionMode})`);
 
-    let pendingEntries = sortedAccounts.map((account) => ({
-      account,
-      deferUntilMs: 0,
-      deferReason: "",
-      debtTurns: 0
-    }));
+    const nowRoundMs = Date.now();
+    let pendingEntries = [];
+    for (const account of sortedAccounts) {
+      const carryOverState = carryOverDeferStateByAccount.get(account.name);
+      const carryUntilMs = Number(carryOverState && carryOverState.untilMs ? carryOverState.untilMs : 0);
+
+      if (!args.dryRun && Number.isFinite(carryUntilMs) && carryUntilMs > nowRoundMs) {
+        const waitSeconds = Math.max(1, Math.ceil((carryUntilMs - nowRoundMs) / 1000));
+        const carryReason = String(carryOverState && carryOverState.reason ? carryOverState.reason : "deferred");
+        console.log(
+          `[cycle] Round ${loopRound}/${totalLoopRounds} skip ${account.name}: ` +
+          `${carryReason} cooldown ${waitSeconds}s remaining`
+        );
+        continue;
+      }
+
+      if (carryOverState) {
+        carryOverDeferStateByAccount.delete(account.name);
+      }
+
+      pendingEntries.push({
+        account,
+        deferUntilMs: 0,
+        deferReason: "",
+        debtTurns: 0,
+        smartFillAttempts: 0,
+        smartFillBlockRecipients: [],
+        smartFillPriority: 0
+      });
+    }
     let deferPassCount = 0;
 
     while (pendingEntries.length > 0) {
@@ -3997,16 +5528,46 @@ async function runDailyCycle(context) {
               accountSnapshots,
               loopRound,
               totalLoopRounds,
-              maxLoopTxOverride: sendMode === "balance-only" ? null : 1
+              maxLoopTxOverride: sendMode === "balance-only" ? null : 1,
+              smartFillBlockRecipients: Array.isArray(entry.smartFillBlockRecipients)
+                ? entry.smartFillBlockRecipients
+                : [],
+              resumeFromDeferReason: entry.deferReason || ""
             });
             roundResults.push({ entry, result, error: null });
           } catch (error) {
-            console.error(`[error] Round ${loopRound}/${totalLoopRounds} | Account ${account.name}: ${error.message}`);
-            roundResults.push({ 
-              entry, 
-              result: { success: false, account: account.name }, 
-              error: error.message 
-            });
+            // Check if this is a soft restart error (consecutive timeouts)
+            const isSoftRestart = error && error.isSoftRestart;
+            if (isSoftRestart) {
+              console.log(
+                `[soft-restart] ${account.name} triggered soft restart due to consecutive timeouts. ` +
+                `Resetting connection pool and deferring to next round...`
+              );
+              
+              // Reset connection pool to clear stuck connections
+              await resetConnectionPool();
+              
+              // Defer with longer delay (120s) to allow connection reset to take effect
+              roundResults.push({ 
+                entry, 
+                result: { 
+                  success: false, 
+                  account: account.name,
+                  deferred: true,
+                  deferReason: "soft-restart-timeout",
+                  deferRetryAfterSeconds: 120 // Retry after 120s (longer for recovery)
+                }, 
+                error: null,
+                softRestart: true
+              });
+            } else {
+              console.error(`[error] Round ${loopRound}/${totalLoopRounds} | Account ${account.name}: ${error.message}`);
+              roundResults.push({ 
+                entry, 
+                result: { success: false, account: account.name }, 
+                error: error.message 
+              });
+            }
           }
 
           // Small delay between sequential accounts (not the full jitter)
@@ -4054,16 +5615,46 @@ async function runDailyCycle(context) {
               accountSnapshots,
               loopRound,
               totalLoopRounds,
-              maxLoopTxOverride: sendMode === "balance-only" ? null : 1
+              maxLoopTxOverride: sendMode === "balance-only" ? null : 1,
+              smartFillBlockRecipients: Array.isArray(entry.smartFillBlockRecipients)
+                ? entry.smartFillBlockRecipients
+                : [],
+              resumeFromDeferReason: entry.deferReason || ""
             });
             return { entry, result, error: null };
           } catch (error) {
-            console.error(`[error] Round ${loopRound}/${totalLoopRounds} | Account ${account.name}: ${error.message}`);
-            return { 
-              entry, 
-              result: { success: false, account: account.name }, 
-              error: error.message 
-            };
+            // Check if this is a soft restart error (consecutive timeouts)
+            const isSoftRestart = error && error.isSoftRestart;
+            if (isSoftRestart) {
+              console.log(
+                `[soft-restart] ${account.name} triggered soft restart due to consecutive timeouts. ` +
+                `Resetting connection pool and deferring to next round...`
+              );
+              
+              // Reset connection pool to clear stuck connections
+              await resetConnectionPool();
+              
+              // Defer with longer delay (120s) to allow connection reset to take effect
+              return { 
+                entry, 
+                result: { 
+                  success: false, 
+                  account: account.name,
+                  deferred: true,
+                  deferReason: "soft-restart-timeout",
+                  deferRetryAfterSeconds: 120 // Retry after 120s (longer for recovery)
+                }, 
+                error: null,
+                softRestart: true
+              };
+            } else {
+              console.error(`[error] Round ${loopRound}/${totalLoopRounds} | Account ${account.name}: ${error.message}`);
+              return { 
+                entry, 
+                result: { success: false, account: account.name }, 
+                error: error.message 
+              };
+            }
           }
         });
         
@@ -4074,6 +5665,25 @@ async function runDailyCycle(context) {
       // Process results
       let passMadeProgress = false;
       const nextPendingEntries = delayedEntries.slice();
+      const inboundSendersByRecipient = new Map();
+
+      for (const { entry, result, error } of roundResults) {
+        if (error || !result || !Array.isArray(result.sentRecipientLabels)) {
+          continue;
+        }
+
+        for (const recipientLabelRaw of result.sentRecipientLabels) {
+          const recipientLabel = String(recipientLabelRaw || "").trim();
+          if (!recipientLabel) {
+            continue;
+          }
+
+          if (!inboundSendersByRecipient.has(recipientLabel)) {
+            inboundSendersByRecipient.set(recipientLabel, []);
+          }
+          inboundSendersByRecipient.get(recipientLabel).push(entry.account.name);
+        }
+      }
       
       for (const { entry, result, error } of roundResults) {
         if (error) {
@@ -4084,6 +5694,73 @@ async function runDailyCycle(context) {
         results.push({ ...result, round: loopRound });
 
         if (result && result.deferred && sendMode !== "balance-only") {
+          const deferReason = String(result.deferReason || "temporary");
+
+          // Insufficient balance should not block the current parallel round.
+          // Let other accounts continue, then retry this account in the next round.
+          if (
+            deferReason === "insufficient-balance" ||
+            deferReason === "fragmented-balance" ||
+            deferReason === "internal-avoid-sendback" ||
+            deferReason === "balance-not-available" ||
+            deferReason === "session-reuse-transient"
+          ) {
+            const requiredLabel = Number.isFinite(Number(result.deferRequiredAmount))
+              ? `need=${result.deferRequiredAmount}`
+              : "need=n/a";
+            const availableLabel = Number.isFinite(Number(result.deferAvailableAmount))
+              ? `have=${result.deferAvailableAmount}`
+              : "have=n/a";
+            const inboundSenders = inboundSendersByRecipient.get(entry.account.name) || [];
+            const smartFillAttempts = Math.max(
+              0,
+              clampToNonNegativeInt(entry.smartFillAttempts, 0)
+            );
+
+            if (
+              sendMode === "internal" &&
+              inboundSenders.length > 0 &&
+              smartFillAttempts < SMART_FILL_MAX_ATTEMPTS_PER_ROUND
+            ) {
+              const retryAfterSeconds = SMART_FILL_RETRY_DELAY_SECONDS;
+              const inboundSendersLabel = inboundSenders.join(", ");
+              console.log(
+                `[cycle] Smart-fill ${entry.account.name}: inbound from [${inboundSendersLabel}] detected. ` +
+                `Retry in ${retryAfterSeconds}s (attempt ${smartFillAttempts + 1}/${SMART_FILL_MAX_ATTEMPTS_PER_ROUND})`
+              );
+
+              nextPendingEntries.push({
+                account: entry.account,
+                deferUntilMs: Date.now() + (retryAfterSeconds * 1000),
+                deferReason: "smart-fill",
+                debtTurns: (entry.debtTurns || 0) + 1,
+                smartFillAttempts: smartFillAttempts + 1,
+                smartFillBlockRecipients: inboundSenders.slice(),
+                smartFillPriority: 2
+              });
+              passMadeProgress = true;
+              continue;
+            }
+
+            const carryOverRetryAfterSeconds = Math.max(
+              30,
+              clampToNonNegativeInt(
+                result.deferRetryAfterSeconds,
+                CARRY_OVER_ROUND_DEFER_DEFAULT_SECONDS
+              )
+            );
+            carryOverDeferStateByAccount.set(entry.account.name, {
+              untilMs: Date.now() + (carryOverRetryAfterSeconds * 1000),
+              reason: deferReason
+            });
+
+            console.log(
+              `[cycle] ${entry.account.name} carry-over to next round (${deferReason}) ` +
+              `${requiredLabel} ${availableLabel} retry=${carryOverRetryAfterSeconds}s`
+            );
+            continue;
+          }
+
           const retryAfterSeconds = Math.max(
             1,
             clampToNonNegativeInt(result.deferRetryAfterSeconds, roundDeferPollSeconds)
@@ -4096,15 +5773,25 @@ async function runDailyCycle(context) {
             ? `have=${result.deferAvailableAmount}`
             : "have=n/a";
           console.log(
-            `[cycle] Deferred ${entry.account.name}: reason=${result.deferReason || "temporary"} ${requiredLabel} ${availableLabel} retry=${retryAfterSeconds}s`
+            `[cycle] Deferred ${entry.account.name}: reason=${deferReason} ${requiredLabel} ${availableLabel} retry=${retryAfterSeconds}s`
           );
           nextPendingEntries.push({
             account: entry.account,
             deferUntilMs,
-            deferReason: result.deferReason || "temporary",
-            debtTurns: (entry.debtTurns || 0) + 1
+            deferReason,
+            debtTurns: (entry.debtTurns || 0) + 1,
+            smartFillAttempts: clampToNonNegativeInt(entry.smartFillAttempts, 0),
+            smartFillBlockRecipients: Array.isArray(entry.smartFillBlockRecipients)
+              ? entry.smartFillBlockRecipients
+              : [],
+            smartFillPriority: clampToNonNegativeInt(entry.smartFillPriority, 0)
+          });
+          carryOverDeferStateByAccount.set(entry.account.name, {
+            untilMs: deferUntilMs,
+            reason: deferReason
           });
         } else {
+          carryOverDeferStateByAccount.delete(entry.account.name);
           passMadeProgress = true;
         }
       }
@@ -4117,6 +5804,13 @@ async function runDailyCycle(context) {
       }
 
       nextPendingEntries.sort((left, right) => {
+        const priorityDiff =
+          clampToNonNegativeInt(right.smartFillPriority, 0) -
+          clampToNonNegativeInt(left.smartFillPriority, 0);
+        if (priorityDiff !== 0) {
+          return priorityDiff;
+        }
+
         const debtDiff = (right.debtTurns || 0) - (left.debtTurns || 0);
         if (debtDiff !== 0) {
           return debtDiff;
@@ -4132,15 +5826,6 @@ async function runDailyCycle(context) {
           console.warn(
             `[warn] Round ${loopRound}/${totalLoopRounds} reached defer pass limit (${maxDeferPassesPerRound}). Carry unresolved to next round: ${unresolvedNames}`
           );
-          for (const unresolved of nextPendingEntries) {
-            results.push({
-              success: false,
-              account: unresolved.account.name,
-              round: loopRound,
-              deferred: true,
-              error: `Deferred unresolved in round ${loopRound}`
-            });
-          }
           pendingEntries = [];
           break;
         }
