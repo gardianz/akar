@@ -23,6 +23,11 @@
     "maxConcurrentSessionReuse": 1,
     "sessionReuseRetryJitterSeconds": 8
   },
+  "telegram": {
+    "enabled": true,
+    "botToken": "YOUR_BOT_TOKEN_HERE",
+    "chatId": "YOUR_CHAT_ID_HERE"
+  },
   "ui": {
     "dashboard": true,
     "logLines": 20

@@ -1,3 +1,9 @@
-﻿_remote_akar/
+_remote_akar/
 __MACOSX/
-
+node_modules/
+.env
+tokens.json
+accounts.json
+*.log
+.DS_Store
+opencode.json
