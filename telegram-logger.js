@@ -70,7 +70,13 @@ class TelegramLogger {
   formatLog(level, message, accountTag = null) {
     const timestamp = new Date().toLocaleString('id-ID', { 
       timeZone: 'Asia/Jakarta',
-      hour12: false 
+      hour12: false,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
     });
     
     const emoji = {
@@ -80,11 +86,15 @@ class TelegramLogger {
       'SUCCESS': '✅'
     }[level.toUpperCase()] || '📝';
 
-    const accountInfo = accountTag ? `[${accountTag}] ` : '';
+    // Clean message - remove extra whitespace and newlines
+    const cleanMsg = String(message)
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const accountInfo = accountTag ? `<code>[${accountTag}]</code> ` : '';
     
-    return `${emoji} <b>${level.toUpperCase()}</b>\n` +
-           `🕐 ${timestamp}\n` +
-           `${accountInfo}${this.escapeHtml(message)}`;
+    // Format: Single line, compact
+    return `${emoji} <b>${level.toUpperCase()}</b> | ${timestamp}\n${accountInfo}${this.escapeHtml(cleanMsg)}`;
   }
 
   escapeHtml(text) {

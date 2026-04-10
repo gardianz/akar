@@ -75,30 +75,68 @@ function parseLogMessage(message) {
   const text = message.text || '';
   const timestamp = new Date(message.date * 1000).toISOString();
 
+  // Skip empty messages
+  if (!text.trim()) {
+    return null;
+  }
+
   // Parse emoji and level
   let level = 'INFO';
-  if (text.includes('❌') || text.includes('ERROR')) level = 'ERROR';
-  else if (text.includes('⚠️') || text.includes('WARN')) level = 'WARN';
-  else if (text.includes('✅') || text.includes('SUCCESS')) level = 'SUCCESS';
-  else if (text.includes('ℹ️') || text.includes('INFO')) level = 'INFO';
+  if (text.includes('❌') || text.toLowerCase().includes('error') || text.toLowerCase().includes('failed')) {
+    level = 'ERROR';
+  } else if (text.includes('⚠️') || text.toLowerCase().includes('warn') || text.toLowerCase().includes('warning')) {
+    level = 'WARN';
+  } else if (text.includes('✅') || text.toLowerCase().includes('success') || text.toLowerCase().includes(' ok ')) {
+    level = 'SUCCESS';
+  } else if (text.includes('ℹ️') || text.toLowerCase().includes('info')) {
+    level = 'INFO';
+  }
 
-  // Extract account tag
-  const accountMatch = text.match(/\[(A\d+\/\d+)\]/);
+  // Extract account tag - support multiple formats
+  const accountMatch = text.match(/\[(A\d+\/\d+)\]/) || text.match(/Account\s+(\d+)/i);
   const accountTag = accountMatch ? accountMatch[1] : null;
 
-  // Clean message
+  // Clean message - remove emojis, HTML tags, and redundant info
   let cleanMessage = text
-    .replace(/[ℹ️⚠️❌✅📝🕐👥📊📈🚀🛑]/g, '')
-    .replace(/<\/?b>/g, '')
-    .replace(/INFO|WARN|ERROR|SUCCESS/gi, '')
-    .replace(/\[A\d+\/\d+\]/g, '')
+    // Remove all emojis
+    .replace(/[\u{1F300}-\u{1F9FF}]|[\u{2600}-\u{26FF}]|[\u{2700}-\u{27BF}]/gu, '')
+    // Remove HTML tags
+    .replace(/<\/?[^>]+(>|$)/g, '')
+    // Remove level keywords
+    .replace(/\b(INFO|WARN|WARNING|ERROR|SUCCESS)\b/gi, '')
+    // Remove account tags
+    .replace(/\[(A\d+\/\d+)\]/g, '')
+    .replace(/Account\s+\d+/gi, '')
+    // Remove timestamps in various formats
+    .replace(/\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}[\s,]+\d{1,2}:\d{2}(:\d{2})?/g, '')
+    .replace(/\d{1,2}:\d{2}(:\d{2})?(\s*(AM|PM|WIB|UTC))?/gi, '')
+    // Remove multiple spaces
+    .replace(/\s+/g, ' ')
     .trim();
 
-  // Remove timestamp line
-  const lines = cleanMessage.split('\n').filter(line => {
-    return !line.match(/^\d{1,2}\/\d{1,2}\/\d{4}/) && line.trim();
-  });
-  cleanMessage = lines.join(' ').trim();
+  // Split by newlines and clean each line
+  const lines = cleanMessage.split('\n')
+    .map(line => line.trim())
+    .filter(line => {
+      // Filter out empty lines and timestamp-only lines
+      if (!line) return false;
+      if (line.match(/^\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}/)) return false;
+      if (line.match(/^\d{1,2}:\d{2}/)) return false;
+      return true;
+    });
+
+  // Join lines with space, or use first meaningful line
+  cleanMessage = lines.length > 0 ? lines.join(' ') : text;
+  
+  // Final cleanup
+  cleanMessage = cleanMessage
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Skip if message is too short or meaningless
+  if (cleanMessage.length < 3) {
+    return null;
+  }
 
   return {
     message_id: message.message_id,
