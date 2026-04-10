@@ -939,9 +939,13 @@ class PinnedDashboard {
   }
 
   async sendDashboardToTelegram() {
-    if (!telegramLogger) return;
+    if (!telegramLogger) {
+      console.log('[Telegram] Logger not initialized, skipping dashboard send');
+      return;
+    }
 
     try {
+      console.log('[Telegram] Preparing to send dashboard...');
       const now = new Date().toLocaleString("id-ID", {
         hour12: false,
         timeZone: "Asia/Jakarta"
@@ -967,9 +971,11 @@ class PinnedDashboard {
 
       message += `</pre>`;
 
+      console.log('[Telegram] Sending dashboard message...');
       await telegramLogger.sendMessage(message, { parse_mode: 'HTML' });
+      console.log('[Telegram] Dashboard sent successfully!');
     } catch (err) {
-      // Silent fail
+      console.error('[Telegram] Failed to send dashboard:', err.message);
     }
   }
 }
@@ -6266,6 +6272,13 @@ async function runDailyCycle(context) {
       console.log(
         `[cycle] Round ${loopRound}/${totalLoopRounds} completed. Waiting ${delayRoundSec}s before next round...`
       );
+      
+      // Send dashboard after each round
+      if (dashboard && typeof dashboard.sendDashboardToTelegram === 'function') {
+        console.log('[cycle] Sending dashboard to Telegram...');
+        await dashboard.sendDashboardToTelegram();
+      }
+      
       await sleep(delayRoundSec * 1000);
     }
   }
@@ -6309,11 +6322,25 @@ async function run() {
   if (TelegramLogger && config.telegram && config.telegram.enabled) {
     try {
       telegramLogger = new TelegramLogger(config.telegram);
-      console.log('[Telegram] Logger initialized');
-      // Send start notification
+      console.log('[Telegram] Logger initialized successfully');
+      console.log('[Telegram] Bot Token:', config.telegram.botToken ? 'SET' : 'NOT SET');
+      console.log('[Telegram] Chat ID:', config.telegram.chatId ? 'SET' : 'NOT SET');
+      
+      // Send start notification and test
       await telegramLogger.sendStartNotification(accounts.accounts.length);
+      console.log('[Telegram] Start notification sent');
+      
+      // Test send
+      await telegramLogger.sendMessage('✅ <b>Bot Started Successfully</b>\nTelegram integration is working!', { parse_mode: 'HTML' });
+      console.log('[Telegram] Test message sent');
     } catch (err) {
-      console.log('[Telegram] Failed to initialize:', err.message);
+      console.error('[Telegram] Failed to initialize:', err.message);
+      console.error('[Telegram] Stack:', err.stack);
+    }
+  } else {
+    console.log('[Telegram] Logger not enabled or module not found');
+    if (config.telegram) {
+      console.log('[Telegram] Config:', JSON.stringify(config.telegram, null, 2));
     }
   }
 
