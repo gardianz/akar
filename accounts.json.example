@@ -1,0 +1,10 @@
+{
+  "defaultAccount": "Account1",
+  "accounts": [
+    {
+      "name": "Account1",
+      "email": "your-email@gmail.com",
+      "address": "alias1::1220abcd..."
+    }
+  ]
+}

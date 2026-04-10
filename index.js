@@ -613,7 +613,7 @@ function getTimeStamp() {
 }
 
 class PinnedDashboard {
-  constructor({ enabled, logLines, accountSnapshots }) {
+  constructor({ enabled, logLines, accountSnapshots, telegramLogger }) {
     this.enabled = Boolean(enabled && process.stdout.isTTY);
     this.logLines = Math.min(
       20,
@@ -621,6 +621,7 @@ class PinnedDashboard {
     );
     this.logs = [];
     this.accountSnapshots = isObject(accountSnapshots) ? accountSnapshots : {};
+    this.telegramLogger = telegramLogger || null;
     this.state = {
       phase: "init",
       selectedAccount: "-",
@@ -939,8 +940,8 @@ class PinnedDashboard {
   }
 
   async sendDashboardToTelegram() {
-    if (!telegramLogger) {
-      console.log('[Telegram] Logger not initialized, skipping dashboard send');
+    if (!this.telegramLogger) {
+      console.log('[Telegram] Logger not initialized in dashboard, skipping dashboard send');
       return;
     }
 
@@ -972,7 +973,7 @@ class PinnedDashboard {
       message += `</pre>`;
 
       console.log('[Telegram] Sending dashboard message...');
-      await telegramLogger.sendMessage(message, { parse_mode: 'HTML' });
+      await this.telegramLogger.sendMessage(message, { parse_mode: 'HTML' });
       console.log('[Telegram] Dashboard sent successfully!');
     } catch (err) {
       console.error('[Telegram] Failed to send dashboard:', err.message);
@@ -4968,7 +4969,8 @@ async function processAccount(context) {
       !args.noDashboard &&
       process.env.ROOTSFI_NO_DASHBOARD !== "1",
     logLines: accountConfig.ui.logLines,
-    accountSnapshots
+    accountSnapshots,
+    telegramLogger: telegramLogger
   });
 
   const initialDashboardState = {
