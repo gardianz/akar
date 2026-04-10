@@ -18,6 +18,23 @@ const path = require("path");
 const crypto = require("crypto");
 
 // ---------------------------------------------------------------------------
+// Telegram Logger Integration
+// ---------------------------------------------------------------------------
+let TelegramLogger;
+let telegramLogger = null;
+try {
+  TelegramLogger = require('./telegram-logger.js');
+  const configPath = path.join(__dirname, 'config.json');
+  const configData = require(configPath);
+  if (configData.telegram && configData.telegram.enabled) {
+    telegramLogger = new TelegramLogger(configData.telegram);
+    console.log('[Telegram] Logger initialized for check-in bot');
+  }
+} catch (err) {
+  console.log('[Telegram] Logger not available, continuing without Telegram integration');
+}
+
+// ---------------------------------------------------------------------------
 // Optional dependencies
 // ---------------------------------------------------------------------------
 let puppeteer = null;
@@ -754,6 +771,65 @@ function renderDashboard(accounts, results, state) {
   // Clear screen and redraw
   process.stdout.write("\x1B[2J\x1B[H");
   console.log(lines.join("\n"));
+
+  // Send to Telegram if state is DONE
+  if (state === "DONE" && telegramLogger) {
+    sendDashboardToTelegram(accounts, results, now);
+  }
+}
+
+async function sendDashboardToTelegram(accounts, results, timestamp) {
+  if (!telegramLogger) return;
+
+  try {
+    // Build table using monospace formatting
+    let message = `<b>🎯 RootsFi Daily Check-In</b>\n`;
+    message += `📅 ${timestamp}\n`;
+    message += `👥 ${accounts.length} accounts\n\n`;
+    message += `<pre>`;
+    message += `Account         Status  Streak Points Tier\n`;
+    message += `${"─".repeat(50)}\n`;
+
+    let okCount = 0;
+    let failCount = 0;
+
+    for (const acc of accounts) {
+      const r = results[acc.name];
+      let status = "PENDING";
+      let streak = "-";
+      let points = "-";
+      let tier = "-";
+
+      if (r) {
+        if (r.ok) {
+          okCount++;
+          status = r.reason === "already-checked-in" ? "DONE" : "OK";
+          streak = String(r.streak || 0) + "d";
+          points = String(r.points || 0);
+          tier = r.tier || "-";
+        } else {
+          failCount++;
+          status = "FAIL";
+        }
+      }
+
+      // Format with fixed width
+      const name = pad(acc.name, 15);
+      const statusPad = pad(status, 7);
+      const streakPad = pad(streak, 6);
+      const pointsPad = pad(points, 6);
+      const tierPad = tier;
+
+      message += `${name} ${statusPad} ${streakPad} ${pointsPad} ${tierPad}\n`;
+    }
+
+    message += `</pre>\n`;
+    message += `\n✅ Success: ${okCount} | ❌ Failed: ${failCount}`;
+
+    await telegramLogger.sendMessage(message, { parse_mode: 'HTML' });
+  } catch (err) {
+    console.log('[Telegram] Failed to send dashboard:', err.message);
+  }
 }
 
 function pad(str, len) {

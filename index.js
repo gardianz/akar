@@ -1,6 +1,15 @@
 #!/usr/bin/env node
 "use strict";
 
+// Telegram Logger Integration
+let TelegramLogger;
+let telegramLogger = null;
+try {
+  TelegramLogger = require('./telegram-logger.js');
+} catch (err) {
+  console.log('[Telegram] Logger module not found, continuing without Telegram integration');
+}
+
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const process = require("node:process");
@@ -927,6 +936,41 @@ class PinnedDashboard {
     lines.push("Ctrl+C to stop  |  Round delay: config.send.delayCycleSeconds");
 
     process.stdout.write(`\x1b[2J\x1b[H${lines.join("\n")}\n`);
+  }
+
+  async sendDashboardToTelegram() {
+    if (!telegramLogger) return;
+
+    try {
+      const now = new Date().toLocaleString("id-ID", {
+        hour12: false,
+        timeZone: "Asia/Jakarta"
+      }) + " WIB";
+      const rows = this.parseAccountRows();
+      const modeLabel = String(this.state.mode || "-").toUpperCase();
+
+      let message = `<b>🤖 RootsFi Bot Dashboard</b>\n`;
+      message += `📅 ${now}\n`;
+      message += `👥 ${rows.length} accounts | Mode: ${modeLabel}\n`;
+      message += `📊 Sends: ${this.state.swapsTotal} (✅${this.state.swapsOk} ❌${this.state.swapsFail})\n\n`;
+      message += `<pre>`;
+      message += `Account         Status    CC        TX\n`;
+      message += `${"─".repeat(45)}\n`;
+
+      for (const row of rows) {
+        const name = this.formatCell(row.name, 15);
+        const status = this.formatCell(row.status, 9);
+        const cc = this.formatCell(row.cc, 9);
+        const tx = row.progress || "-";
+        message += `${name} ${status} ${cc} ${tx}\n`;
+      }
+
+      message += `</pre>`;
+
+      await telegramLogger.sendMessage(message, { parse_mode: 'HTML' });
+    } catch (err) {
+      // Silent fail
+    }
   }
 }
 
@@ -6261,6 +6305,18 @@ async function run() {
   const legacyCookies = extractLegacyAccountCookies(rawAccounts);
   const tokens = normalizeTokens(rawTokens, accounts);
 
+  // Initialize Telegram Logger
+  if (TelegramLogger && config.telegram && config.telegram.enabled) {
+    try {
+      telegramLogger = new TelegramLogger(config.telegram);
+      console.log('[Telegram] Logger initialized');
+      // Send start notification
+      await telegramLogger.sendStartNotification(accounts.accounts.length);
+    } catch (err) {
+      console.log('[Telegram] Failed to initialize:', err.message);
+    }
+  }
+
   for (const accountEntry of accounts.accounts) {
     const profile = tokens.accounts[accountEntry.name] || normalizeTokenProfile({});
     if (!String(profile.cookie || "").trim() && legacyCookies.has(accountEntry.name)) {
@@ -6379,6 +6435,21 @@ async function run() {
         console.log(`[cycle] Next cycle at: ${formatUTCTime(nextCycleTime)}`);
         console.log(`[cycle] Waiting: ${formatDuration(waitMs)}`);
         console.log(`${"=".repeat(70)}\n`);
+        
+        // Send dashboard to Telegram
+        if (dashboard && typeof dashboard.sendDashboardToTelegram === 'function') {
+          await dashboard.sendDashboardToTelegram();
+        }
+        
+        // Send cycle summary to Telegram
+        if (telegramLogger) {
+          const summary = `📊 <b>Cycle #${cycleCount} Complete</b>\n\n` +
+                         `✅ Success: ${cycleResult.successful.length}\n` +
+                         `❌ Failed: ${cycleResult.failed.length}\n` +
+                         `⏱ Duration: ${formatDuration(cycleResult.cycleDuration)}\n` +
+                         `🔄 Next cycle: ${formatUTCTime(nextCycleTime)}`;
+          await telegramLogger.sendMessage(summary, { parse_mode: 'HTML' });
+        }
         
         await sleep(waitMs);
       }
