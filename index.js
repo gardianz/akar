@@ -48,6 +48,43 @@ const sessionReuseWaitQueue = [];
 const cachedSecurityCookies = new Map();
 let browserChallengeRateLimitedUntilMs = 0;
 
+// Track all spawned Chromium PIDs so we can kill zombies
+const trackedBrowserPids = new Set();
+
+function trackBrowserPid(browser) {
+  try {
+    const proc = browser.process();
+    if (proc && proc.pid) {
+      trackedBrowserPids.add(proc.pid);
+      return proc.pid;
+    }
+  } catch {}
+  return null;
+}
+
+function untrackBrowserPid(pid) {
+  if (pid) trackedBrowserPids.delete(pid);
+}
+
+function killZombieBrowsers() {
+  for (const pid of trackedBrowserPids) {
+    try {
+      process.kill(pid, 0); // test if alive
+      process.kill(pid, "SIGKILL");
+      console.log(`[browser-cleanup] Killed zombie Chromium pid ${pid}`);
+    } catch {
+      // Process already dead — clean up tracking
+    }
+    trackedBrowserPids.delete(pid);
+  }
+}
+
+// Run zombie cleanup every 2 minutes
+setInterval(killZombieBrowsers, 120000).unref();
+
+// Also clean up on exit
+process.on("exit", killZombieBrowsers);
+
 // ============================================================================
 // CONNECTION POOL RESET FOR SOFT RESTART RECOVERY
 // ============================================================================
@@ -1649,6 +1686,24 @@ function isVercelCheckpointError(error) {
   return message.includes("Vercel Security Checkpoint");
 }
 
+function isCheckpointOr429Error(error) {
+  const status = Number(error && error.status);
+  if (status === 429) {
+    return true;
+  }
+
+  if (isVercelCheckpointError(error)) {
+    return true;
+  }
+
+  const message = String(error && error.message ? error.message : error || "").toLowerCase();
+  return (
+    message.includes("http 429") ||
+    message.includes("failed preflight get /onboard") ||
+    message.includes("fetch failed")
+  );
+}
+
 function isSessionReuseTimeoutError(error) {
   const status = Number(error && error.status);
   if (Number.isFinite(status)) {
@@ -1662,6 +1717,34 @@ function isSessionReuseTimeoutError(error) {
     message.includes("aborted") ||
     message.includes("fetch failed") ||
     message.includes("network")
+  );
+}
+
+function isFetchFailedTransientError(error) {
+  const status = Number(error && error.status);
+  if (Number.isFinite(status)) {
+    return false;
+  }
+
+  const message = String(error && error.message ? error.message : error || "").toLowerCase();
+  return (
+    message.includes("fetch failed") ||
+    message.includes("socket hang up") ||
+    message.includes("econnreset") ||
+    message.includes("client network socket disconnected")
+  );
+}
+
+function isSessionReuseImmediateFetchRestartError(error) {
+  if (!error) {
+    return false;
+  }
+
+  const message = String(error && error.message ? error.message : error || "").toLowerCase();
+  return (
+    message.includes("trigger immediate client hot-restart") ||
+    message.includes("fetch/network failure detected") ||
+    message.includes("fetch failed")
   );
 }
 
@@ -1902,7 +1985,11 @@ function normalizeConfig(rawConfig) {
     ),
     maxSessionReuseTransientBrowserRefreshes: Math.max(
       0,
-      clampToNonNegativeInt(sessionInput.maxSessionReuseTransientBrowserRefreshes, 0)
+      clampToNonNegativeInt(sessionInput.maxSessionReuseTransientBrowserRefreshes, 1)
+    ),
+    transientBrowserRefreshTriggerFailures: Math.max(
+      1,
+      clampToNonNegativeInt(sessionInput.transientBrowserRefreshTriggerFailures, 2)
     ),
     sessionReuseTransientRetryAfterSeconds: Math.max(
       15,
@@ -2361,6 +2448,7 @@ async function solveBrowserChallenge(baseUrl, onboardPath, userAgent, headless =
 
   await acquireBrowserChallengeSlot();
   let browser = null;
+  let trackedPid = null;
   try {
     console.log("[browser] Launching browser to solve Vercel challenge...");
     console.log("[browser] Mode: " + (headless ? "headless" : "visible"));
@@ -2379,6 +2467,7 @@ async function solveBrowserChallenge(baseUrl, onboardPath, userAgent, headless =
       ],
       defaultViewport: null
     });
+    trackedPid = trackBrowserPid(browser);
 
     const page = await browser.newPage();
 
@@ -2409,7 +2498,7 @@ async function solveBrowserChallenge(baseUrl, onboardPath, userAgent, headless =
       : BROWSER_CHALLENGE_MAX_ATTEMPTS;
 
     if (status === 429) {
-      console.log(`[browser] 429 detected, using 429 challenge mode ( checks).`);
+      console.log(`[browser] 429 detected, using 429 challenge mode (${probeAttempts} checks).`);
     }
 
     console.log("[browser] Waiting for Vercel challenge to resolve...");
@@ -2488,7 +2577,13 @@ async function solveBrowserChallenge(baseUrl, onboardPath, userAgent, headless =
           closeError && closeError.message ? closeError.message : closeError || "unknown"
         );
         console.log(`[browser] Browser close warning: ${closeMessage}`);
+        // Force kill Chromium if close() failed to prevent zombie
+        if (trackedPid) {
+          try { process.kill(trackedPid, "SIGKILL"); console.log(`[browser] Force-killed Chromium pid ${trackedPid}`); }
+          catch {}
+        }
       }
+      untrackBrowserPid(trackedPid);
     }
     releaseBrowserChallengeSlot();
   }
@@ -4292,6 +4387,16 @@ async function refreshVercelSecurityCookies(client, config, reasonLabel, onCheck
     client.logCookieStatus("after refresh preflight");
   } catch (error) {
     console.log(`[warn] Refresh preflight still blocked: ${error.message}`);
+
+    if (isCheckpointOr429Error(error)) {
+      markBrowserChallengeRateLimited(retryAfterSeconds);
+      return {
+        refreshed: false,
+        unavailable: true,
+        retryAfterSeconds,
+        reason: "refresh-preflight-blocked"
+      };
+    }
   }
 
   return {
@@ -4319,7 +4424,11 @@ async function attemptSessionReuse(client, config, onCheckpointRefresh, accountL
   );
   const maxTransientBrowserRefreshes = Math.max(
     0,
-    clampToNonNegativeInt(config.session.maxSessionReuseTransientBrowserRefreshes, 0)
+    clampToNonNegativeInt(config.session.maxSessionReuseTransientBrowserRefreshes, 1)
+  );
+  const transientBrowserRefreshTriggerFailures = Math.max(
+    1,
+    clampToNonNegativeInt(config.session.transientBrowserRefreshTriggerFailures, 2)
   );
   const transientRetryAfterSeconds = Math.max(
     15,
@@ -4400,19 +4509,60 @@ async function attemptSessionReuse(client, config, onCheckpointRefresh, accountL
       lastError = error;
 
       if (isSessionReuseTimeoutError(error)) {
+        const fetchFailedTransient = isFetchFailedTransientError(error);
+
+        // For fetch failures (likely Vercel 429 rate limit at TCP level),
+        // do NOT immediately bail — wait with extended backoff and retry.
+        // The 429 window typically clears within 30-60s.
+        if (fetchFailedTransient) {
+          logSession(
+            `[warn] Session reuse fetch/network failure detected (possible 429 rate limit). ` +
+            `Will retry with extended backoff instead of immediate restart.`
+          );
+        }
+
         transientFailureCount += 1;
+        let browserRefreshAttemptedThisAttempt = false;
 
         if (transientLightResetCount < maxTransientLightResets) {
           transientLightResetCount += 1;
           logSession(
             `[info] Session reuse transient recovery (light reset ${transientLightResetCount}/${maxTransientLightResets})`
           );
-          await resetConnectionPool();
-        } else if (
+          await resetConnectionPool({ forceReset: true });
+        }
+
+        // Only force browser refresh after 3+ fetch failures — early fetch failures
+        // are likely 429 rate limits that just need time, not browser recovery.
+        const shouldForceImmediateBrowserRefresh =
+          fetchFailedTransient &&
+          transientFailureCount >= 3 &&
           config.session.autoRefreshCheckpoint &&
-          transientBrowserRefreshCount < maxTransientBrowserRefreshes
-        ) {
+          transientBrowserRefreshCount < maxTransientBrowserRefreshes;
+        // For fetch failures (likely 429 rate limit), skip browser refresh entirely
+        // on early attempts — browser launch adds more requests to Vercel, worsening
+        // the rate limit. Only use browser refresh for non-fetch transient errors
+        // (real timeouts, Vercel checkpoint blocks).
+        const shouldRunTransientBrowserRefresh =
+          !fetchFailedTransient &&
+          config.session.autoRefreshCheckpoint &&
+          transientBrowserRefreshCount < maxTransientBrowserRefreshes &&
+          (transientFailureCount >= transientBrowserRefreshTriggerFailures ||
+            shouldForceImmediateBrowserRefresh);
+
+        if (shouldRunTransientBrowserRefresh) {
           transientBrowserRefreshCount += 1;
+          browserRefreshAttemptedThisAttempt = true;
+          if (
+            shouldForceImmediateBrowserRefresh &&
+            transientFailureCount < transientBrowserRefreshTriggerFailures
+          ) {
+            logSession(
+              `[info] Session reuse fetch/network failure detected. ` +
+                `Escalating to browser refresh immediately (${transientBrowserRefreshCount}/${maxTransientBrowserRefreshes}).`
+            );
+          }
+
           let refreshResult = null;
           try {
             refreshResult = await refreshVercelSecurityCookies(
@@ -4451,6 +4601,26 @@ async function attemptSessionReuse(client, config, onCheckpointRefresh, accountL
           }
         }
 
+        const browserRefreshRecoveryExhausted =
+          !config.session.autoRefreshCheckpoint ||
+          transientBrowserRefreshCount >= maxTransientBrowserRefreshes;
+        const lightResetRecoveryExhausted =
+          transientLightResetCount >= maxTransientLightResets;
+        // For fetch failures (likely 429), don't bail early just because light reset
+        // and browser refresh are exhausted. The maxTransientAttempts check below is
+        // the proper guard — fetch failures just need time to clear the rate limit.
+        if (
+          fetchFailedTransient &&
+          !browserRefreshAttemptedThisAttempt &&
+          lightResetRecoveryExhausted &&
+          browserRefreshRecoveryExhausted
+        ) {
+          logSession(
+            `[info] Fetch/network failure after recovery actions exhausted. ` +
+            `Continuing retry with backoff (${transientFailureCount}/${maxTransientAttempts})...`
+          );
+        }
+
         if (transientFailureCount >= maxTransientAttempts) {
           const transientLimitError = new Error(
             `Session reuse transient retry limit reached (${maxTransientAttempts}) after repeated network failures.`
@@ -4464,21 +4634,24 @@ async function attemptSessionReuse(client, config, onCheckpointRefresh, accountL
           };
         }
 
-        const retryBaseSeconds = Math.min(20, transientRetryAfterSeconds);
+        // For fetch failures (likely 429 rate limit), use significantly longer backoff.
+        // Normal timeouts: base ~20s. Fetch failures: base ~45s to let rate limit window clear.
+        const fetchFailedExtra = fetchFailedTransient ? 25 : 0;
+        const retryBaseSeconds = Math.min(20, transientRetryAfterSeconds) + fetchFailedExtra;
         const retryStepSeconds = Math.min(12, (transientFailureCount - 1) * 3);
         const retryJitterAddSeconds = retryJitterSeconds > 0
           ? randomIntInclusive(0, retryJitterSeconds)
           : 0;
         const retryDelaySeconds = Math.max(
-          5,
+          fetchFailedTransient ? 30 : 5,
           Math.min(
-            transientRetryAfterSeconds + retryJitterSeconds,
+            transientRetryAfterSeconds + retryJitterSeconds + fetchFailedExtra,
             retryBaseSeconds + retryStepSeconds + retryJitterAddSeconds
           )
         );
         logSession(
-          `[info] Session reuse timeout detected. Retrying in ${retryDelaySeconds}s... ` +
-          `(transient ${transientFailureCount}/${maxTransientAttempts})`
+          `[info] Session reuse ${fetchFailedTransient ? "fetch failure (likely 429)" : "timeout"} detected. ` +
+          `Retrying in ${retryDelaySeconds}s... (transient ${transientFailureCount}/${maxTransientAttempts})`
         );
         await sleep(retryDelaySeconds * 1000);
         continue;
@@ -4542,6 +4715,10 @@ async function sendOtpWithCheckpointRecovery(client, selectedEmail, config, onCh
     1,
     clampToNonNegativeInt(config.session.maxOtpRefreshAttempts, 3)
   );
+  const otpCheckpointRetryAfterSeconds = Math.max(
+    60,
+    clampToNonNegativeInt(config.session.browserChallengeRetryAfterSeconds, 120)
+  );
   const settleDelayMs = Math.max(
     0,
     clampToNonNegativeInt(config.session.checkpointSettleDelayMs, 3500)
@@ -4553,20 +4730,60 @@ async function sendOtpWithCheckpointRecovery(client, selectedEmail, config, onCh
       return await client.sendOtp(selectedEmail);
     } catch (error) {
       lastError = error;
+
+      if (error && error.code === "SEND_OTP_CHECKPOINT_DEFER") {
+        throw error;
+      }
+
       if (
         !isVercelCheckpointError(error) ||
-        !config.session.autoRefreshCheckpoint ||
-        attempt >= maxAttempts
+        !config.session.autoRefreshCheckpoint
       ) {
         throw error;
       }
 
-      await refreshVercelSecurityCookies(
-        client,
-        config,
-        `Send OTP blocked by Vercel checkpoint (attempt ${attempt}/${maxAttempts}), refreshing browser security cookies...`,
-        onCheckpointRefresh
-      );
+      if (attempt >= maxAttempts) {
+        const deferError = new Error(
+          `Send OTP checkpoint persisted after ${maxAttempts} attempts.`
+        );
+        deferError.code = "SEND_OTP_CHECKPOINT_DEFER";
+        deferError.retryAfterSeconds = otpCheckpointRetryAfterSeconds;
+        throw deferError;
+      }
+
+      let refreshResult = null;
+      try {
+        refreshResult = await refreshVercelSecurityCookies(
+          client,
+          config,
+          `Send OTP blocked by Vercel checkpoint (attempt ${attempt}/${maxAttempts}), refreshing browser security cookies...`,
+          onCheckpointRefresh
+        );
+      } catch (refreshError) {
+        if (refreshError && refreshError.code === "BROWSER_CHALLENGE_NO_COOKIES") {
+          const deferError = new Error(
+            "Send OTP deferred: browser challenge returned no cookies."
+          );
+          deferError.code = "SEND_OTP_CHECKPOINT_DEFER";
+          deferError.retryAfterSeconds = otpCheckpointRetryAfterSeconds;
+          throw deferError;
+        }
+        throw refreshError;
+      }
+
+      if (refreshResult && refreshResult.unavailable) {
+        const refreshRetryAfter = Math.max(
+          otpCheckpointRetryAfterSeconds,
+          clampToNonNegativeInt(refreshResult.retryAfterSeconds, otpCheckpointRetryAfterSeconds)
+        );
+        const deferError = new Error(
+          "Send OTP deferred: browser challenge temporarily unavailable."
+        );
+        deferError.code = "SEND_OTP_CHECKPOINT_DEFER";
+        deferError.retryAfterSeconds = refreshRetryAfter;
+        throw deferError;
+      }
+
       client.logCookieStatus(`after refresh before send-otp retry ${attempt}`);
       if (settleDelayMs > 0) {
         console.log(`[info] Waiting ${settleDelayMs}ms for Vercel token settle before send-otp retry...`);
@@ -4632,14 +4849,25 @@ async function processAccount(context) {
   const accountConfig = cloneRuntimeConfig(config);
 
   if (safeResumeFromDeferReason) {
-    accountConfig.session.maxSessionReuseTransientAttempts = 1;
-    accountConfig.session.maxSessionReuseLightResets = 0;
-    accountConfig.session.maxSessionReuseTransientBrowserRefreshes = 0;
+    const resumeNeedsCheckpointRefresh =
+      safeResumeFromDeferReason === "session-reuse-transient" ||
+      safeResumeFromDeferReason === "otp-checkpoint";
+
+    accountConfig.session.maxSessionReuseTransientAttempts = resumeNeedsCheckpointRefresh ? 3 : 2;
+    accountConfig.session.maxSessionReuseLightResets = 1;
+    accountConfig.session.maxSessionReuseTransientBrowserRefreshes = resumeNeedsCheckpointRefresh
+      ? Math.max(
+          1,
+          clampToNonNegativeInt(accountConfig.session.maxSessionReuseTransientBrowserRefreshes, 1)
+        )
+      : 0;
+    accountConfig.session.transientBrowserRefreshTriggerFailures = resumeNeedsCheckpointRefresh ? 1 : 2;
     accountConfig.session.sessionReuseTransientRetryAfterSeconds = 20;
     console.log(
       `[session] Fast retry mode for deferred account (${safeResumeFromDeferReason}): ` +
       `transient=${accountConfig.session.maxSessionReuseTransientAttempts} ` +
-      `lightResets=${accountConfig.session.maxSessionReuseLightResets}`
+      `lightResets=${accountConfig.session.maxSessionReuseLightResets} ` +
+      `browserRefresh=${accountConfig.session.maxSessionReuseTransientBrowserRefreshes}`
     );
   }
   const configuredMaxLoopTx = clampToNonNegativeInt(
@@ -4911,12 +5139,14 @@ async function processAccount(context) {
       updateCookieDashboard(client);
 
       if (sessionReuse && !sessionReuse.ok && sessionReuse.error && sessionReuse.error.code === "SESSION_REUSE_TRANSIENT_RETRY_LIMIT") {
+        const hotRestartCooldownSeconds = 30 + randomIntInclusive(5, 15);
         console.log(
           withAccountTag(
             accountLogTag,
-            "[info] Session transient limit reached. Trying one-time client hot-restart (rerun-like recovery)..."
+            `[info] Session transient limit reached. Cooling down ${hotRestartCooldownSeconds}s before hot-restart (rerun-like recovery)...`
           )
         );
+        await sleep(hotRestartCooldownSeconds * 1000);
 
         await resetConnectionPool({ forceReset: true });
 
@@ -4932,9 +5162,9 @@ async function processAccount(context) {
               )
             );
         hotRestartConfig.session.maxSessionReuseLightResets = isDeferredResume
-          ? 0
+          ? 1
           : Math.max(
-              0,
+              1,
               Math.min(
                 1,
                 clampToNonNegativeInt(accountConfig.session.maxSessionReuseLightResets, 1)
@@ -4966,14 +5196,91 @@ async function processAccount(context) {
           sessionReuse = hotRestartReuse;
           updateCookieDashboard(client, "session-hot-restart");
         } else {
+          const hotRestartError = hotRestartReuse.error;
           console.log(
             withAccountTag(
               accountLogTag,
-              `[warn] Session hot-restart did not recover: ${hotRestartReuse.error ? hotRestartReuse.error.message : "unknown"}`
+              `[warn] Session hot-restart did not recover: ${hotRestartError ? hotRestartError.message : "unknown"}`
             )
           );
           client = hotRestartClient;
           sessionReuse = hotRestartReuse;
+
+          if (isSessionReuseImmediateFetchRestartError(hotRestartError)) {
+            dashboard.setState({ phase: "session-reuse-cold-rerun" });
+            const coldRestartCooldownSeconds = 20 + randomIntInclusive(5, 10);
+            console.log(
+              withAccountTag(
+                accountLogTag,
+                `[warn] Fetch/network failure persists after hot-restart. Cooling down ${coldRestartCooldownSeconds}s before cold rerun (no OTP fallback)...`
+              )
+            );
+            await sleep(coldRestartCooldownSeconds * 1000);
+
+            await resetConnectionPool({ forceReset: true });
+
+            const coldRestartConfig = cloneRuntimeConfig(accountConfig);
+            applyTokenProfileToConfig(coldRestartConfig, accountToken);
+            coldRestartConfig.session.maxSessionReuseTransientAttempts = 2;
+            coldRestartConfig.session.maxSessionReuseLightResets = 1;
+            coldRestartConfig.session.maxSessionReuseTransientBrowserRefreshes = Math.max(
+              1,
+              clampToNonNegativeInt(accountConfig.session.maxSessionReuseTransientBrowserRefreshes, 1)
+            );
+            coldRestartConfig.session.transientBrowserRefreshTriggerFailures = 1;
+            coldRestartConfig.session.sessionReuseTransientRetryAfterSeconds = 20;
+
+            const coldRestartClient = new RootsFiApiClient(coldRestartConfig);
+            const cachedSecurityMap = buildCachedSecurityCookieMap();
+            if (cachedSecurityMap.size > 0) {
+              coldRestartClient.mergeCookies(cachedSecurityMap);
+            }
+
+            if (coldRestartConfig.session.autoRefreshCheckpoint) {
+              try {
+                await refreshVercelSecurityCookies(
+                  coldRestartClient,
+                  coldRestartConfig,
+                  "Cold rerun-like browser verification after hot-restart fetch failure",
+                  markCheckpointRefresh
+                );
+                coldRestartClient.logCookieStatus("after cold rerun browser verification");
+              } catch (refreshError) {
+                console.log(
+                  withAccountTag(
+                    accountLogTag,
+                    `[warn] Cold rerun browser verification failed: ${refreshError.message}`
+                  )
+                );
+              }
+            }
+
+            coldRestartClient.logCookieStatus("before cold rerun session attempt");
+
+            const coldRestartReuse = await attemptSessionReuse(
+              coldRestartClient,
+              coldRestartConfig,
+              markCheckpointRefresh,
+              accountLogTag
+            );
+
+            if (coldRestartReuse.ok) {
+              console.log(withAccountTag(accountLogTag, "[info] Cold rerun-like session restart succeeded."));
+              client = coldRestartClient;
+              sessionReuse = coldRestartReuse;
+              updateCookieDashboard(client, "session-cold-rerun");
+            } else {
+              console.log(
+                withAccountTag(
+                  accountLogTag,
+                  `[warn] Cold rerun-like session restart did not recover: ${coldRestartReuse.error ? coldRestartReuse.error.message : "unknown"}`
+                )
+              );
+              client = coldRestartClient;
+              sessionReuse = coldRestartReuse;
+            }
+          }
+
           updateCookieDashboard(client);
         }
       }
@@ -5152,12 +5459,68 @@ async function processAccount(context) {
 
     dashboard.setState({ phase: "otp-send" });
     console.log(withAccountTag(accountLogTag, "[step] Send OTP"));
-    const sendOtpResponse = await sendOtpWithCheckpointRecovery(
-      client,
-      selectedEmail,
-      accountConfig,
-      markCheckpointRefresh
-    );
+    let sendOtpResponse = null;
+    try {
+      sendOtpResponse = await sendOtpWithCheckpointRecovery(
+        client,
+        selectedEmail,
+        accountConfig,
+        markCheckpointRefresh
+      );
+    } catch (error) {
+      const otpCheckpointDefer = error && error.code === "SEND_OTP_CHECKPOINT_DEFER";
+      if (otpCheckpointDefer || isCheckpointOr429Error(error)) {
+        const fallbackRetryAfterSeconds = Math.max(
+          60,
+          clampToNonNegativeInt(accountConfig.session.browserChallengeRetryAfterSeconds, 120)
+        );
+        const retryAfterSeconds = Math.max(
+          30,
+          clampToNonNegativeInt(
+            error && error.retryAfterSeconds,
+            fallbackRetryAfterSeconds
+          )
+        );
+        const errorMessage = String(error && error.message ? error.message : error || "unknown");
+
+        dashboard.setState({
+          phase: "cooldown",
+          transfer: "deferred (otp-checkpoint)",
+          send: `OTP checkpoint deferred ${retryAfterSeconds}s`,
+          cooldown: `${retryAfterSeconds}s`
+        });
+        console.log(
+          withAccountTag(
+            accountLogTag,
+            `[warn] OTP flow blocked by checkpoint. Defer ${retryAfterSeconds}s. Detail: ${errorMessage}`
+          )
+        );
+
+        tokens.accounts[account.name] = applyClientStateToTokenProfile(
+          accountToken,
+          client,
+          checkpointRefreshCount,
+          lastVercelRefreshAt
+        );
+        await saveTokensSerial(tokensPath, tokens);
+
+        return {
+          success: true,
+          account: account.name,
+          mode: "otp-checkpoint-deferred",
+          deferred: true,
+          deferReason: "otp-checkpoint",
+          deferRetryAfterSeconds: retryAfterSeconds,
+          deferRequiredAmount: null,
+          deferAvailableAmount: null,
+          sentRecipientLabels: [],
+          txCompleted: 0,
+          txSkipped: 0
+        };
+      }
+
+      throw error;
+    }
     updateCookieDashboard(client);
     const otpId = sendOtpResponse && sendOtpResponse.data ? sendOtpResponse.data.otpId : null;
 
@@ -5703,7 +6066,8 @@ async function runDailyCycle(context) {
             deferReason === "fragmented-balance" ||
             deferReason === "internal-avoid-sendback" ||
             deferReason === "balance-not-available" ||
-            deferReason === "session-reuse-transient"
+            deferReason === "session-reuse-transient" ||
+            deferReason === "otp-checkpoint"
           ) {
             const requiredLabel = Number.isFinite(Number(result.deferRequiredAmount))
               ? `need=${result.deferRequiredAmount}`

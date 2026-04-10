@@ -3,7 +3,7 @@
     "maxLoopTx": 342,
     "minDelayTxSeconds": 1,
     "maxDelayTxSeconds": 5,
-    "delayCycleSeconds": 25,
+    "delayCycleSeconds": 55,
     "sequentialAllRounds": true,
     "randomAmount": {
       "enabled": true,
@@ -16,9 +16,12 @@
   "session": {
     "proactiveVercelRefreshMinutes": 0,
     "browserChallengeRetryAfterSeconds": 120,
-    "maxSessionReuseTransientAttempts": 4,
+    "maxSessionReuseTransientAttempts": 3,
+    "maxSessionReuseTransientBrowserRefreshes": 2,
+    "transientBrowserRefreshTriggerFailures": 1,
+    "sessionReuseTransientRetryAfterSeconds": 30,
     "maxConcurrentSessionReuse": 1,
-    "sessionReuseRetryJitterSeconds": 12
+    "sessionReuseRetryJitterSeconds": 8
   },
   "ui": {
     "dashboard": true,
